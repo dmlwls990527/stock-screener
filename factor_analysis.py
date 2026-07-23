@@ -140,6 +140,18 @@ def get_name_map(conn, table="ticker_master"):
     return {code: name for code, name in rows}
 
 
+def get_sector_map(conn, table="ticker_master_us"):
+    """code -> GICS 섹터 매핑. sector 컬럼이 없으면(KR ticker_master) 빈 dict."""
+    try:
+        cur = conn.cursor()
+        cur.execute(f"SELECT code, sector FROM {table}")
+        rows = cur.fetchall()
+        cur.close()
+        return {code: sec for code, sec in rows if sec}
+    except Exception:
+        return {}
+
+
 def assign_tier(rank):
     for i in range(len(TIER_BINS) - 1):
         if TIER_BINS[i] < rank <= TIER_BINS[i + 1]:
@@ -1324,6 +1336,74 @@ def write_trend_sheet(ws, trend_df, ref, market):
         ws.add_chart(ch, anchor)
 
 
+def write_sector_sheet(ws, result, top_n=20):
+    """섹터 집중도 참고 시트 — 유니버스/상위N의 GICS 섹터 분포 + HHI 집중도지수.
+    '지금 모델이 한 섹터(예: 반도체/IT)에 얼마나 쏠려 있나'를 매 실행마다 보여준다."""
+    ws.title = "섹터 집중도"
+    if "sector" not in result.columns or result["sector"].notna().sum() == 0:
+        ws["A1"] = "섹터 데이터 없음 (국내(KR) ticker_master 에는 sector 컬럼이 없음)"
+        return
+    r = result.copy()
+    r["sector"] = r["sector"].fillna("(미분류)")
+    topN  = r.head(top_n)
+    n_top = len(topN)
+
+    agg = (r.groupby("sector")
+             .agg(uni=("code", "count"), avg=("종합점수", "mean"))
+             .reset_index())
+    topcnt = topN["sector"].value_counts()
+    agg["topn"]   = agg["sector"].map(topcnt).fillna(0).astype(int)
+    agg["share"]  = (agg["topn"] / n_top * 100).round(0)
+    agg["avg"]    = agg["avg"].round(1)
+    agg = agg.sort_values(["topn", "uni"], ascending=False)
+
+    share = topcnt / n_top
+    hhi     = float((share ** 2).sum())
+    top_sec = share.idxmax() if len(share) else "-"
+    top_sh  = float(share.max()) * 100 if len(share) else 0.0
+    flag = "⚠ 고집중" if hhi >= 0.25 else ("· 중간" if hhi >= 0.15 else "· 분산")
+
+    ws.merge_cells("A1:E1")
+    t = ws["A1"]
+    t.value = (f"섹터 집중도 (모델 상위{n_top} 기준)   |   최다 섹터: {top_sec} {top_sh:.0f}%   |   "
+               f"HHI {hhi:.2f}  {flag}")
+    hdr_style(t, size=12)
+    ws.row_dimensions[1].height = 26
+
+    ws.merge_cells("A2:E2")
+    info = ws["A2"]
+    info.value = ("HHI(허핀달지수) = 상위N 섹터 비중의 제곱합. 1.00=한 섹터 몰빵, 0.09=11개 섹터 균등분산. "
+                  "0.25↑면 특정 섹터 편중이 큼 — 분산 점검 신호.")
+    info.fill = PatternFill("solid", fgColor="EBF3FB")
+    info.font = Font(italic=True, size=9, color="1F4E79")
+    info.alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[2].height = 16
+
+    headers = ["GICS 섹터", "유니버스\n종목수", f"모델 상위{n_top}\n종목수",
+               f"상위{n_top}\n비중(%)", "평균\n종합점수"]
+    for c, h in enumerate(headers, 1):
+        hdr_style(ws.cell(3, c, h), bg=COLOR_SUB_HDR)
+    ws.row_dimensions[3].height = 30
+
+    for i, (_, row) in enumerate(agg.iterrows()):
+        rr = i + 4
+        alt = (i % 2 == 1)
+        data_style(ws.cell(rr, 1, row["sector"]), alt)
+        data_style(ws.cell(rr, 2, int(row["uni"])), alt)
+        c3 = ws.cell(rr, 3, int(row["topn"]))
+        data_style(c3, alt)
+        cp = ws.cell(rr, 4, row["share"])
+        data_style(cp, alt, '0"%"')
+        # 비중이 높을수록(=쏠릴수록) 눈에 띄게: 40%+ 빨강, 20%+ 노랑
+        if row["share"] >= 40:   cp.fill = PatternFill("solid", fgColor=COLOR_NEG)
+        elif row["share"] >= 20: cp.fill = PatternFill("solid", fgColor=COLOR_POS_MID)
+        data_style(ws.cell(rr, 5, row["avg"] if pd.notna(row["avg"]) else None), alt, '0.0')
+
+    for col, w in zip("ABCDE", [26, 12, 14, 12, 12]):
+        ws.column_dimensions[col].width = w
+    ws.freeze_panes = "A4"
+
+
 def save_excel(result, f1_detail, f2_detail, market, years, out_path,
                trend_df=None, ref_dates=None, name_map=None):
     wb = Workbook()
@@ -1332,6 +1412,7 @@ def save_excel(result, f1_detail, f2_detail, market, years, out_path,
     write_summary_sheet(wb.active, result, market, years, today_str, name_map)
     if trend_df is not None and len(trend_df):
         write_trend_sheet(wb.create_sheet("시총Top추이", 1), trend_df, ref_dates, market)
+    write_sector_sheet(wb.create_sheet(), result)
     write_detail_sheet(wb.create_sheet(), f1_detail, "marcap",
                        "시총_상세", "시총($B)", "시총_성장률")
     write_detail_sheet(wb.create_sheet(), f2_detail, "total_amount",
@@ -1360,6 +1441,7 @@ def run_factor_analysis(market="us", years=YEARS, top_n=TOP_N):
     conn = get_conn()
     print("  DB 연결 성공\n")
     name_map = get_name_map(conn, "ticker_master_us" if market == "us" else "ticker_master")
+    sector_map = get_sector_map(conn, "ticker_master_us" if market == "us" else "ticker_master")
 
     # Step 0: 현재 유니버스 확정
     print("[0] 현재 유니버스 조회 (고정 Top N)...")
@@ -1544,6 +1626,18 @@ def run_factor_analysis(market="us", years=YEARS, top_n=TOP_N):
 
     # 안전(참고지표) 컬럼 추가 — 점수에 합산하지 않음(IC상 안전↔저수익)
     result = compute_safety_columns(result)
+
+    # 섹터 집중도(참고) — GICS 섹터가 있으면(US) result 에 sector 컬럼 부여 + 콘솔 요약
+    if sector_map:
+        result["sector"] = result["code"].map(sector_map)
+        _top = result.head(20)
+        _sh  = _top["sector"].fillna("(미분류)").value_counts()
+        _hhi = float(((_sh / len(_top)) ** 2).sum())
+        _flag = "고집중" if _hhi >= 0.25 else ("중간" if _hhi >= 0.15 else "분산")
+        print(f"\n  [섹터 집중도] 모델 상위20: "
+              + ", ".join(f"{s} {round(v/len(_top)*100)}%" for s, v in _sh.head(5).items()))
+        print(f"  HHI={_hhi:.2f} ({_flag})  (1.00=한 섹터 몰빵, 0.09=11섹터 균등) "
+              f"→ Excel '섹터 집중도' 탭 참고")
 
     # 출력
     print(f"\n{'='*110}")

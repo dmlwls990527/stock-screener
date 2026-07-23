@@ -270,6 +270,20 @@ def run_us_etl(start: str = "2016-01-01", force: bool = False):
     universe = pd.concat([sp500, nq100], ignore_index=True)\
                  .drop_duplicates(subset=["code"], keep="first")\
                  .reset_index(drop=True)
+    # 섹터 라벨을 표준 GICS 11개로 정규화 — 소스마다 industry/sub-industry 라벨이 섞여
+    # 들어오는 걸(예: 'Semiconductors','Software' → Information Technology) 적재 시점에 통일.
+    GICS_NORMALIZE = {
+        "Software": "Information Technology", "EDP Services": "Information Technology",
+        "Computer Services": "Information Technology", "Semiconductors": "Information Technology",
+        "Biotechnology": "Health Care",
+        "Industrial Machinery": "Industrials", "Aerospace": "Industrials",
+        "Military, Government, Technical": "Industrials",
+        "Catalog/Specialty Distribution": "Consumer Discretionary",
+        "Soft Drinks": "Consumer Staples",
+        "Telecommunications Services": "Communication Services",
+    }
+    if "sector" in universe.columns:
+        universe["sector"] = universe["sector"].replace(GICS_NORMALIZE)
     symbols = universe["code"].tolist()
     print(f"  유니버스: {len(symbols)}개 (S&P500 + NASDAQ-100)\n")
 
