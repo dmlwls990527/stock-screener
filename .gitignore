@@ -1,0 +1,35 @@
+# secrets — NEVER commit these
+setup_dart_auth.sh
+setup_krx_auth.sh
+setup_toss_auth.sh
+.env
+*.pem
+*.key
+
+# environments / caches
+.venv/
+__pycache__/
+.pytest_cache/
+.vscode/
+*.pyc
+
+# generated data / results (not source code)
+*.xlsx
+*.png
+*.json
+*.html
+logs/
+daily_cache/
+fundamental_cache/
+krx_cache/
+us_monthly_cache/
+db_backup/
+charts/
+blog_charts/
+blog_charts_opt/
+marcap/
+top30_yearly/
+xlsx_old_*/
+
+# manual backup snapshots (superseded by git history going forward)
+*.bak_*
