@@ -8,6 +8,7 @@ echo "=== $(date) 시작 ===" >> "$LOG"
 ./.venv/bin/python run_etl.py >> "$LOG" 2>&1
 ./.venv/bin/python factor_analysis.py >> "$LOG" 2>&1
 ./.venv/bin/python factor_analysis.py --kr >> "$LOG" 2>&1
+./.venv/bin/python leader_screener.py >> "$LOG" 2>&1
 
 echo "--- 구형 스크리너 (momentum/paradigm/sector/theme/monthly) ---" >> "$LOG"
 ./.venv/bin/python append_marcap_gap.py >> "$LOG" 2>&1
