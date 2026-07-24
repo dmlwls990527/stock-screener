@@ -465,6 +465,7 @@ if __name__ == "__main__":
     parser.add_argument("--kr", action="store_true", help="국장만 실행")
     parser.add_argument("--us", action="store_true", help="미장만 실행")
     parser.add_argument("--force", action="store_true", help="US 전체 재다운로드 (2016부터 강제)")
+    parser.add_argument("--start", default="2016-01-01", help="US start date for full load, use with --force, e.g. 2010-01-01")
     args = parser.parse_args()
 
     run_both = not args.kr and not args.us  # 인자 없으면 둘 다
@@ -473,6 +474,6 @@ if __name__ == "__main__":
         run_kr_etl(start="20160101")
 
     if args.us or run_both:
-        run_us_etl(start="2016-01-01", force=args.force)
+        run_us_etl(start=args.start, force=args.force)
 
     print("\n모든 ETL 완료.")
