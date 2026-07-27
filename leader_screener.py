@@ -45,10 +45,13 @@ def rev_factors(asof):
         om_now=op[-4:].sum()/ttm*100 if ttm>0 else np.nan
         om_prev=op[-8:-4].sum()/ttmp*100 if ttmp>0 else np.nan
         mtrend=(om_now-om_prev) if (om_now==om_now and om_prev==om_prev) else np.nan
+        mser=np.array([op[i-3:i+1].sum()/rev[i-3:i+1].sum()*100 for i in range(3,len(rev)) if rev[i-3:i+1].sum()>0])
+        mcyc=(mser.max()/np.median(mser)) if (len(mser)>0 and np.median(mser)>0) else np.nan
         out.append(dict(CODE=code, rev_yoy=clip(round(yv[-1],1)),
             rev_accel=clip(round(accel,1)),
             ttm_g=clip(round((ttm-ttmp)/ttmp*100,1)) if ttmp>0 else np.nan,
-            margin_trend=round(mtrend,1) if mtrend==mtrend else np.nan))
+            margin_trend=round(mtrend,1) if mtrend==mtrend else np.nan,
+            pos_ratio=round((yv>0).mean()*100), mcyc=round(mcyc,1) if mcyc==mcyc else np.nan))
     return pd.DataFrame(out)
 
 def mcap(date):
@@ -119,19 +122,29 @@ def screen_now():
     df=build(today); df=add_vol(df)
     nm=fa.get_name_map(conn,"ticker_master_us") if hasattr(fa,"get_name_map") else {}
     df["NAME"]=df["CODE"].map(nm) if nm else ""
+    sec=fa.get_sector_map(conn,"ticker_master_us") if hasattr(fa,"get_sector_map") else {}
+    SKO={"Information Technology":"IT","Health Care":"헬스케어","Industrials":"산업재","Consumer Discretionary":"임의소비","Consumer Staples":"필수소비","Financials":"금융","Communication Services":"커뮤니","Energy":"에너지","Materials":"소재","Real Estate":"부동산","Utilities":"유틸"}
+    df["섹터"]=df["CODE"].map(lambda c:SKO.get(sec.get(c,""),(sec.get(c,"") or "?")))
+    def _typ(x):
+        if x.get("mcyc")==x.get("mcyc") and x.get("mcyc",0)>=2.5: return "시클리컬"
+        if x.get("pos_ratio")==x.get("pos_ratio") and x.get("pos_ratio",0)>=85: return "꾸준복리"
+        return ""
+    df["유형"]=df.apply(lambda r:_typ({"mcyc":r.get("mcyc"),"pos_ratio":r.get("pos_ratio")}),axis=1)
     df["netier"]=[entry_tier(r0,r1) for r0,r1 in zip(df["RANK0"],df["RANK_1y"])]
-    acol=["trackA_rank","CODE","NAME","MC0_B","RANK0","rev_yoy","rev_accel","ttm_g","margin_trend","fund_z","vol_ann","mdd_1y"]
+    acol=["trackA_rank","CODE","NAME","섹터","유형","MC0_B","RANK0","rev_yoy","margin_trend","mcyc","pos_ratio","fund_z","vol_ann"]
     bcol=["trackB_rank","CODE","NAME","MC0_B","RANK0","rank_up","fund_z","hybrid","vol_ann","mdd_1y"]
     a=df.sort_values("trackA_rank")[acol].head(20)
     b=df[df["trackB_pass"]].sort_values("trackB_rank")[bcol]
     ne=df[df["netier"].notna()].sort_values(["netier","fund_z"],ascending=[True,False]).copy()
-    ne["신규진입"]=ne["netier"].astype(int).map(lambda t:"->Top"+str(t))
-    ne=ne[["신규진입","CODE","NAME","MC0_B","RANK0","RANK_1y","rank_up","fund_z","hybrid","vol_ann","mdd_1y"]]
+    ne["신규진입"]=ne["netier"].astype(int).map(lambda t:str(t)+"위내진입")
+    ne=ne[["신규진입","CODE","NAME","섹터","유형","MC0_B","RANK0","rank_up","fund_z","mcyc","vol_ann"]]
+    KOR={"trackA_rank":"순위","trackB_rank":"순위","CODE":"티커","NAME":"종목명","MC0_B":"시총(십억$)","RANK0":"시총순위","RANK_1y":"1년전순위","rev_yoy":"매출증가율%","rev_accel":"매출가속도","ttm_g":"연간매출성장%","margin_trend":"영업마진추세%p","mcyc":"마진변동성(배)","pos_ratio":"성장지속%","fund_z":"펀더멘털점수","vol_ann":"주가변동성%","mdd_1y":"최대낙폭%","rank_up":"순위상승폭","hybrid":"종합점수"}
+    a=a.rename(columns=KOR); b=b.rename(columns=KOR); ne=ne.rename(columns=KOR)
     out="/data/frame/leader_watchlist_latest.xlsx"
     with pd.ExcelWriter(out,engine="openpyxl") as w:
-        ne.to_excel(w,sheet_name="신규Top진입",index=False)
-        a.to_excel(w,sheet_name="TrackA_펀더멘털가속",index=False)
-        b.to_excel(w,sheet_name="TrackB_순위상승(게이트)",index=False)
+        ne.to_excel(w,sheet_name="신규진입",index=False)
+        a.to_excel(w,sheet_name="펀더멘털가속",index=False)
+        b.to_excel(w,sheet_name="순위상승",index=False)
         pd.DataFrame({"항목":["기준일","유니버스","변동성/MDD","한계"],"값":[today,f"{len(df)}종(생존자편향)","연율변동성%·최대낙폭%=참고용(필터X), 비중조절용","워치리스트=후보, 매수신호 아님. 분산·소액 전제"]}).to_excel(w,sheet_name="설명",index=False)
     print(f"기준일 {today} | universe {len(df)}")
     print(f"\n[신규 Top진입 ({len(ne)}종) — 최근1년 상위권 신규진입]"); print(ne.head(12).to_string(index=False))
