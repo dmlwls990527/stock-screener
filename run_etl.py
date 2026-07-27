@@ -255,6 +255,24 @@ def run_us_etl(start: str = "2016-01-01", force: bool = False):
             result["sector"] = None
         return result
 
+    # S&P 중형주(400)·소형주(600) = 작은 회사 추가(초기 포착용). S&P500과 같은 위키 표 방식.
+    def get_sp_supp(slug, mkt):
+        resp = requests.get(f"https://en.wikipedia.org/wiki/{slug}", headers=HEADERS)
+        tables = pd.read_html(StringIO(resp.text))
+        symnames = ("Symbol","Ticker","Ticker symbol")
+        df = next((t for t in tables if any(str(c) in symnames for c in t.columns)), None)
+        if df is None:
+            raise ValueError(f"{slug} 심볼 테이블 없음")
+        symcol  = next(c for c in df.columns if str(c) in symnames)
+        namecol = next((c for c in df.columns if str(c) in ("Security","Company","Name")), None)
+        seccol  = next((c for c in df.columns if "GICS Sector" in str(c) or str(c) == "Sector"), None)
+        out = pd.DataFrame()
+        out["code"]   = df[symcol].astype(str).str.replace(".", "-", regex=False)
+        out["name"]   = df[namecol] if namecol else out["code"]
+        out["sector"] = df[seccol] if seccol else None
+        out["market"] = mkt
+        return out
+
     sp500  = get_sp500();  sp500["market"]  = "SP500"
     try:
         nq100  = get_nasdaq100(); nq100["market"] = "NQ100"
@@ -267,7 +285,15 @@ def run_us_etl(start: str = "2016-01-01", force: bool = False):
         nq100 = pd.DataFrame(_cur.fetchall(), columns=["code", "name", "sector"])
         nq100["market"] = "NQ100"
         _c.close()
-    universe = pd.concat([sp500, nq100], ignore_index=True)\
+    extra = []
+    for slug, mkt in [("List_of_S%26P_400_companies", "SP400"),
+                      ("List_of_S%26P_600_companies", "SP600")]:
+        try:
+            e = get_sp_supp(slug, mkt); extra.append(e)
+            print(f"  {mkt}: {len(e)}종 추가")
+        except Exception as ex:
+            print(f"  ⚠️  {mkt} 스크랩 실패({ex!r}) — 건너뜀")
+    universe = pd.concat([sp500, nq100, *extra], ignore_index=True)\
                  .drop_duplicates(subset=["code"], keep="first")\
                  .reset_index(drop=True)
     # 섹터 라벨을 표준 GICS 11개로 정규화 — 소스마다 industry/sub-industry 라벨이 섞여
@@ -317,10 +343,28 @@ def run_us_etl(start: str = "2016-01-01", force: bool = False):
         dl_start = start
         print(f"[US-2] 전체 적재 모드 — {dl_start}부터 다운로드 (force={force})")
 
-    print(f"  OHLCV 다운로드 중... ({len(symbols)}종목)")
-    raw = yf.download(symbols, start=dl_start, end=end,
-                      interval="1d", progress=True, auto_adjust=True)
-    df_ohlcv = raw.stack(level="Ticker", future_stack=True).reset_index()
+    # yfinance는 종목이 아주 많으면(수백~천개) 한 번에 받다가 상당수를 조용히 빠뜨림.
+    # → 120종씩 끊어서 받고 이어붙임(청크 실패해도 나머지는 살림).
+    print(f"  OHLCV 다운로드 중... ({len(symbols)}종목, 120개씩 나눠서)")
+    CHUNK = 120
+    _parts = []
+    for _i in range(0, len(symbols), CHUNK):
+        _syms = symbols[_i:_i+CHUNK]
+        try:
+            _raw = yf.download(_syms, start=dl_start, end=end,
+                               interval="1d", progress=False, auto_adjust=True, threads=True)
+            if _raw is None or _raw.empty:
+                print(f"  {_i//CHUNK+1}번째 청크 비어있음"); time.sleep(1); continue
+            if isinstance(_raw.columns, pd.MultiIndex):
+                _p = _raw.stack(level="Ticker", future_stack=True).reset_index()
+            else:
+                _p = _raw.reset_index(); _p["Ticker"] = _syms[0]
+            _parts.append(_p)
+            print(f"  {min(_i+CHUNK,len(symbols))}/{len(symbols)} 받음")
+        except Exception as _e:
+            print(f"  청크 {_i//CHUNK+1} 실패: {_e!r}")
+        time.sleep(1)
+    df_ohlcv = pd.concat(_parts, ignore_index=True) if _parts else pd.DataFrame()
     df_ohlcv.columns.name = None
     df_ohlcv = df_ohlcv.rename(columns={
         "Date":"date_","Ticker":"code",
@@ -380,7 +424,9 @@ def run_us_etl(start: str = "2016-01-01", force: bool = False):
     print("-" * 60)
 
     for i, date_str in enumerate(date_list):
-        if date_str.replace("-", "") in loaded:  # YYYY-MM-DD -> YYYYMMDD (loaded 포맷 일치)
+        # 증분 모드에서만 이미 있는 날짜를 건너뜀. force면 전부 다시 적재(신규 종목이
+        # 기존 날짜에도 들어가야 하므로 날짜 스킵을 끈다 — 이게 소형주가 안 들어오던 버그였음).
+        if (not force) and date_str.replace("-", "") in loaded:
             skipped += 1
             continue
 
@@ -390,6 +436,10 @@ def run_us_etl(start: str = "2016-01-01", force: bool = False):
 
         cur = conn.cursor()
         try:
+            if force:
+                # 그 날짜의 기존 행을 지우고 df_day(신규+기존 전 종목)를 다시 넣음 → 중복/PK충돌 방지
+                cur.execute("DELETE FROM daily_price_us  WHERE date_ = TO_DATE(?, 'YYYY-MM-DD')", [date_str])
+                cur.execute("DELETE FROM daily_marcap_us WHERE date_ = TO_DATE(?, 'YYYY-MM-DD')", [date_str])
             # daily_price_us
             sql_p = """INSERT INTO daily_price_us
                 (date_, code, open, high, low, close, volume, amount, changes_ratio)

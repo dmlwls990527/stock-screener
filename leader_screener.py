@@ -18,6 +18,18 @@ import pandas as pd, numpy as np
 import factor_analysis as fa
 
 CAP=300.0
+# 데이터가 짧거나 깨져도 시클리컬로 확실히 태그할 알려진 경기민감 종목(메모리·소재·에너지·자동차 등).
+# std/추세 지표가 못 잡을 때의 백업. 유니버스에 없는 티커는 무해.
+CYC_HARD={"MU","WDC","STX","SNDK","MRVL",            # 메모리 반도체
+          "X","NUE","CLF","STLD",                     # 철강
+          "FCX","AA","NEM",                            # 비철금속/광산
+          "XOM","CVX","COP","OXY","DVN","EOG","SLB","HAL",  # 에너지(석유·가스)
+          "EXE","FANG","CTRA","EQT","AR","APA","MRO","HES", # 에너지 추가(셰일·천연가스 E&P)
+          "DOW","LYB","CE",                            # 화학
+          "F","GM","PCAR",                             # 자동차/트럭
+          "CAT","DE"}                                  # 건설·농기계(매출/물량이 경기 타는 타입 = 마진std 사각지대)
+# 시클리컬 판정 임계값(데이터 보정: 최근20분기 마진 std≥6%p AND 추세상관<0.6 = 경기순환)
+CYC_STD_T, CYC_TREND_T = 6.0, 0.6
 conn=fa.get_conn(); cur=conn.cursor()
 
 def dq(sql):
@@ -45,13 +57,41 @@ def rev_factors(asof):
         om_now=op[-4:].sum()/ttm*100 if ttm>0 else np.nan
         om_prev=op[-8:-4].sum()/ttmp*100 if ttmp>0 else np.nan
         mtrend=(om_now-om_prev) if (om_now==om_now and om_prev==om_prev) else np.nan
-        mser=np.array([op[i-3:i+1].sum()/rev[i-3:i+1].sum()*100 for i in range(3,len(rev)) if rev[i-3:i+1].sum()>0])
-        mcyc=(mser.max()/np.median(mser)) if (len(mser)>0 and np.median(mser)>0) else np.nan
+        # TTM 영업마진 시계열 — NULL 재무 분기는 건너뜀(=nan 오염 방지). 구 mcyc(=max/median)는
+        # median<=0(적자 가는 시클리컬)에서 통째로 NaN이 나 메모리를 못 걸렀음 → std 기반으로 교체.
+        mser=[]
+        for i in range(3,len(rev)):
+            rvw=rev[i-3:i+1]; opw=op[i-3:i+1]
+            if np.isfinite(rvw).all() and np.isfinite(opw).all() and rvw.sum()>0:
+                mser.append(opw.sum()/rvw.sum()*100)
+        mser=np.array(mser)
+        if len(mser)>=4:
+            r=mser[-20:]                                   # 최근 20분기(≈5년) = 지금 사이클을 타는지(일회성 재평가 배제)
+            mstd=float(np.std(r))                          # 마진 변동성(%p): 적자에도 안 깨짐
+            mtcorr=float(np.corrcoef(np.arange(len(r)),r)[0,1]) if np.std(r)>0 else 0.0  # 우상향(턴어라운드) vs 오르내림(경기순환)
+            mpos=(r[-1]-r.min())/(r.max()-r.min())*100 if r.max()>r.min() else np.nan     # 현재 마진의 최근 레인지 내 위치(%): 100=고점, 0=바닥
+            # 되돌림 '기저확률'(예측 아님): 과거에 마진이 얼마나 크게 꺾였나 + 적자 전력. 전체 히스토리 기준.
+            peak=np.maximum.accumulate(mser)
+            mdd=float((mser-peak).min())                   # 최대 마진 낙폭(pp, 음수). 크게 음수 = 크게 되돌린 전력
+            hadloss=int(bool((mser<0).any()))              # 적자 마진 전력(1/0)
+            mmed=float(np.median(mser))                    # 전체기간 마진 중앙값: >0=평소엔 버는 회사(진짜 경기민감) / <0=원래 적자(초기·바이오텍)
+        else:
+            mstd=mtcorr=mpos=mdd=mmed=np.nan; hadloss=np.nan
+        # 한 분기에 매출이 확 뛰면 회사를 합친 것(인수합병)일 수 있음 → 진짜 성장 아닌 착시 주의
+        rj=[(rev[i]-rev[i-1])/rev[i-1]*100 for i in range(max(1,len(rev)-8),len(rev)) if rev[i-1]>0]
+        rev_jump=round(max(rj)) if rj else np.nan
+        ttm_op=float(op[-4:].sum()) if len(op)>=4 and np.isfinite(op[-4:]).all() else np.nan
         out.append(dict(CODE=code, rev_yoy=clip(round(yv[-1],1)),
             rev_accel=clip(round(accel,1)),
             ttm_g=clip(round((ttm-ttmp)/ttmp*100,1)) if ttmp>0 else np.nan,
             margin_trend=round(mtrend,1) if mtrend==mtrend else np.nan,
-            pos_ratio=round((yv>0).mean()*100), mcyc=round(mcyc,1) if mcyc==mcyc else np.nan))
+            pos_ratio=round((yv>0).mean()*100),
+            margin_std=round(mstd,1) if mstd==mstd else np.nan,
+            margin_tcorr=round(mtcorr,2) if mtcorr==mtcorr else np.nan,
+            margin_pos=round(mpos) if mpos==mpos else np.nan,
+            margin_dd=round(mdd) if mdd==mdd else np.nan,
+            margin_med=round(mmed,1) if mmed==mmed else np.nan,
+            rev_jump=rev_jump, had_loss=hadloss, ttm_op=ttm_op))
     return pd.DataFrame(out)
 
 def mcap(date):
@@ -70,6 +110,8 @@ def build(asof):
     df["fund_z"]=pd.concat([z(df["rev_yoy"]),z(df["rev_accel"]),z(df["ttm_g"]),z(df["margin_trend"])],axis=1).mean(axis=1).round(2)  # 매출YoY+가속+TTM성장+마진추세, NaN안전
     df["emrg_z"]=z(df["rank_up"]).round(2)
     df["MC0_B"]=(df["MC0"]/1e9).round(1)
+    # 밸류에이션 프록시: 시총 ÷ TTM영업이익(배). 시클리컬은 '피크 이익' 위라 이게 낮아 보이는 게 함정(피터 린치).
+    df["p_op"]=np.where((df["ttm_op"].astype(float)>0), (df["MC0"].astype(float)/df["ttm_op"].astype(float)).round(1), np.nan)
     # Track A: 펀더멘털 가속 순위
     df["trackA_rank"]=df["fund_z"].rank(ascending=False,method="min").astype(int)
     # Track B: AND게이트(순위상승>0 & 펀더+) + 대형 제외 후 하이브리드
@@ -125,27 +167,55 @@ def screen_now():
     sec=fa.get_sector_map(conn,"ticker_master_us") if hasattr(fa,"get_sector_map") else {}
     SKO={"Information Technology":"IT","Health Care":"헬스케어","Industrials":"산업재","Consumer Discretionary":"임의소비","Consumer Staples":"필수소비","Financials":"금융","Communication Services":"커뮤니","Energy":"에너지","Materials":"소재","Real Estate":"부동산","Utilities":"유틸"}
     df["섹터"]=df["CODE"].map(lambda c:SKO.get(sec.get(c,""),(sec.get(c,"") or "?")))
-    def _typ(x):
-        if x.get("mcyc")==x.get("mcyc") and x.get("mcyc",0)>=2.5: return "시클리컬"
-        if x.get("pos_ratio")==x.get("pos_ratio") and x.get("pos_ratio",0)>=85: return "꾸준복리"
+    # A) 매출·마진 팩터가 안 맞는 섹터 제외: 부동산 리츠(임대수익 구조라 매출/영업이익 개념이 다름)
+    df=df[df["섹터"]!="부동산"].copy()
+    # 제외 후 순위 다시 매김(Track A = 펀더점수, Track B = 종합점수)
+    df["trackA_rank"]=df["fund_z"].rank(ascending=False,method="min").astype(int)
+    df=df.drop(columns=["trackB_rank"])
+    _tb=df[df["trackB_pass"]].sort_values("hybrid",ascending=False).reset_index(drop=True)
+    _tb["trackB_rank"]=_tb.index+1
+    df=df.merge(_tb[["CODE","trackB_rank"]],on="CODE",how="left")
+    def _typ(r):
+        code=r.get("CODE"); ms=r.get("margin_std"); tc=r.get("margin_tcorr"); pr=r.get("pos_ratio"); mmed=r.get("margin_med")
+        volatile=(ms==ms and ms>=CYC_STD_T)          # 마진 변동성 큼
+        uptrend =(tc==tc and tc>=CYC_TREND_T)        # 마진이 추세적 우상향 = 턴어라운드/구조확장(경기순환 아님)
+        profitable=(mmed==mmed and mmed>0)           # 평소엔 흑자 = 진짜 경기민감주. 원래 적자(바이오텍·초기 회사)면 경기민감 아님
+        if (code in CYC_HARD) or (volatile and not uptrend and profitable): return "시클리컬"
+        if volatile and uptrend: return "마진확장"    # 변동성 크지만 우상향(APP·PLTR·NVDA형)
+        if pr==pr and pr>=85: return "꾸준복리"
         return ""
-    df["유형"]=df.apply(lambda r:_typ({"mcyc":r.get("mcyc"),"pos_ratio":r.get("pos_ratio")}),axis=1)
+    df["유형"]=df.apply(_typ,axis=1)
+    def _warn(r):   # 확정 아님, '이럴 수도 있다'는 표시.
+        notes=[]; typ=r.get("유형"); mp=r.get("margin_pos"); dd=r.get("margin_dd"); hl=r.get("had_loss"); rj=r.get("rev_jump")
+        if typ=="시클리컬" and mp==mp:
+            if mp>=80 and ((dd==dd and dd<=-25) or hl==1): notes.append("지금 이익 최고 → 떨어질 수 있음")
+            elif mp<=30: notes.append("지금 이익 바닥 → 반등할지 확인")
+        if rj==rj and rj>=80: notes.append("매출이 한번에 확 뜀 → 합병·분사·상장초기인지 확인(진짜 성장 아닐 수 있음)")
+        return " / ".join(notes)
+    df["주의"]=df.apply(_warn,axis=1)
     df["netier"]=[entry_tier(r0,r1) for r0,r1 in zip(df["RANK0"],df["RANK_1y"])]
-    acol=["trackA_rank","CODE","NAME","섹터","유형","MC0_B","RANK0","rev_yoy","margin_trend","mcyc","pos_ratio","fund_z","vol_ann"]
+    acol=["trackA_rank","CODE","NAME","섹터","유형","주의","MC0_B","RANK0","rev_yoy","margin_trend","margin_std","margin_pos","margin_dd","p_op","pos_ratio","fund_z","vol_ann"]
     bcol=["trackB_rank","CODE","NAME","MC0_B","RANK0","rank_up","fund_z","hybrid","vol_ann","mdd_1y"]
     a=df.sort_values("trackA_rank")[acol].head(20)
     b=df[df["trackB_pass"]].sort_values("trackB_rank")[bcol]
     ne=df[df["netier"].notna()].sort_values(["netier","fund_z"],ascending=[True,False]).copy()
     ne["신규진입"]=ne["netier"].astype(int).map(lambda t:str(t)+"위내진입")
-    ne=ne[["신규진입","CODE","NAME","섹터","유형","MC0_B","RANK0","rank_up","fund_z","mcyc","vol_ann"]]
-    KOR={"trackA_rank":"순위","trackB_rank":"순위","CODE":"티커","NAME":"종목명","MC0_B":"시총(십억$)","RANK0":"시총순위","RANK_1y":"1년전순위","rev_yoy":"매출증가율%","rev_accel":"매출가속도","ttm_g":"연간매출성장%","margin_trend":"영업마진추세%p","mcyc":"마진변동성(배)","pos_ratio":"성장지속%","fund_z":"펀더멘털점수","vol_ann":"주가변동성%","mdd_1y":"최대낙폭%","rank_up":"순위상승폭","hybrid":"종합점수"}
+    ne=ne[["신규진입","CODE","NAME","섹터","유형","주의","MC0_B","RANK0","rank_up","fund_z","margin_std","margin_pos","margin_dd","vol_ann"]]
+    KOR={"trackA_rank":"순위","trackB_rank":"순위","CODE":"티커","NAME":"종목명","MC0_B":"시총(십억$)","RANK0":"시총순위","RANK_1y":"1년전순위","rev_yoy":"매출증가율%","rev_accel":"매출가속도","ttm_g":"연간매출성장%","margin_trend":"영업마진추세%p","margin_std":"마진변동성%p","margin_pos":"마진위치%","margin_dd":"예전 이익하락폭%p","p_op":"시총/영업이익(배)","margin_tcorr":"마진추세상관","pos_ratio":"성장지속%","fund_z":"펀더멘털점수","vol_ann":"주가변동성%","mdd_1y":"최대낙폭%","rank_up":"순위상승폭","hybrid":"종합점수"}
     a=a.rename(columns=KOR); b=b.rename(columns=KOR); ne=ne.rename(columns=KOR)
     out="/data/frame/leader_watchlist_latest.xlsx"
     with pd.ExcelWriter(out,engine="openpyxl") as w:
         ne.to_excel(w,sheet_name="신규진입",index=False)
         a.to_excel(w,sheet_name="펀더멘털가속",index=False)
         b.to_excel(w,sheet_name="순위상승",index=False)
-        pd.DataFrame({"항목":["기준일","유니버스","변동성/MDD","한계"],"값":[today,f"{len(df)}종(생존자편향)","연율변동성%·최대낙폭%=참고용(필터X), 비중조절용","워치리스트=후보, 매수신호 아님. 분산·소액 전제"]}).to_excel(w,sheet_name="설명",index=False)
+        pd.DataFrame({"항목":["기준일","유니버스","마진위치%","주의","예전 이익하락폭%p","시총/영업이익","변동성/MDD","한계"],
+            "값":[today,f"{len(df)}종(지금 살아있는 종목만)",
+                 "지금 이익률이 최근 5년 최고~최저 중 어디쯤(100=제일 잘 벌 때, 0=제일 못 벌 때). 앞일을 맞히는 게 아니라 지금 위치만",
+                 "확정 아님, '이럴 수도 있다'는 표시. 예전에 이익이 크게 꺾인 적 있는 경기민감주가 지금 최고면 '떨어질 수 있음', 지금 바닥이면 '반등할지 확인'",
+                 "예전에 이익이 제일 크게 꺾였던 폭. 클수록 한 번 크게 무너진 적 있다는 뜻",
+                 "회사값(시총)이 지금 버는 이익의 몇 배인지. 경기민감주는 제일 잘 벌 때라 싸 보이는 게 함정",
+                 "주가 출렁임%·고점 대비 최대하락%=참고용(거르는 데 안 씀), 얼마나 담을지 정할 때만",
+                 "이건 '후보 목록'이지 사라는 신호가 아님. 앞일 맞히는 것도 아님. 나눠서 조금씩이 전제"]}).to_excel(w,sheet_name="설명",index=False)
     print(f"기준일 {today} | universe {len(df)}")
     print(f"\n[신규 Top진입 ({len(ne)}종) — 최근1년 상위권 신규진입]"); print(ne.head(12).to_string(index=False))
     print("\n[Track A Top10]"); print(a.head(10).to_string(index=False))
