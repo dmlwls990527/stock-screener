@@ -80,8 +80,23 @@ def rev_factors(asof):
         # 한 분기에 매출이 확 뛰면 회사를 합친 것(인수합병)일 수 있음 → 진짜 성장 아닌 착시 주의
         rj=[(rev[i]-rev[i-1])/rev[i-1]*100 for i in range(max(1,len(rev)-8),len(rev)) if rev[i-1]>0]
         rev_jump=round(max(rj)) if rj else np.nan
+        # 최근 연속으로 매출이 QoQ 증가한 분기 수 = 램프(지속성장) vs 스파이크(단발) 구분.
+        # LQDA 3→9→54→133 = streak 3(진짜 램프). CYTK …67→2→19 = streak 1(반짝). ARWR …264→74 = streak 0.
+        rev_streak=0
+        for i in range(len(rev)-1,0,-1):
+            if rev[i]>rev[i-1]: rev_streak+=1
+            else: break
+        # 최근 꾸준함(%): 최근 6개 QoQ 변화 중 '크게 안 꺾인(≥-5%)' 비율. 램프=높음, 반전 잦으면=낮음.
+        # 신흥주(이제 막 변곡)도 최근만 보므로 안 죽고, 대신 최근 30%+ 급락 있으면 감점.
+        qoq=[(rev[i]-rev[i-1])/abs(rev[i-1]) for i in range(max(1,len(rev)-6),len(rev)) if rev[i-1]!=0]
+        if qoq:
+            consist=100.0*sum(1 for q in qoq if q>=-0.05)/len(qoq)
+            if min(qoq)<-0.30: consist=max(0.0,consist-25)
+            recent_consist=round(consist)
+        else:
+            recent_consist=np.nan
         ttm_op=float(op[-4:].sum()) if len(op)>=4 and np.isfinite(op[-4:]).all() else np.nan
-        out.append(dict(CODE=code, rev_yoy=clip(round(yv[-1],1)),
+        out.append(dict(CODE=code, rev_yoy=clip(round(yv[-1],1)), rev_streak=rev_streak, recent_consist=recent_consist,
             rev_accel=clip(round(accel,1)),
             ttm_g=clip(round((ttm-ttmp)/ttmp*100,1)) if ttmp>0 else np.nan,
             margin_trend=round(mtrend,1) if mtrend==mtrend else np.nan,
@@ -106,19 +121,30 @@ def build(asof):
     mc1=mcap(y1)[["CODE","RANK"]].rename(columns={"RANK":"RANK_1y"})
     df=mc.merge(mc1,on="CODE",how="left").merge(rev_factors(asof),on="CODE",how="inner")
     if df.empty: return df
+    # 신규진입 판정용 '롤링 최저(=최고)순위': 최근 1년 중 최근 2개월을 뺀 구간에서 도달했던 제일 좋은 순위.
+    # 단일 시점(1년 전 하루) 대신 구간 최저를 봐서, 중간에 이미 그 구간에 있었으면 '새 진입 아님'으로 판정.
+    lo=(pd.Timestamp(asof)-pd.Timedelta(days=365)).strftime("%Y-%m-%d")
+    hi=(pd.Timestamp(asof)-pd.Timedelta(days=60)).strftime("%Y-%m-%d")
+    pb=dq(f"SELECT CODE, MIN(\"RANK\") AS RANK_PB FROM daily_marcap_us WHERE date_ BETWEEN TIMESTAMP '{lo} 00:00:00' AND TIMESTAMP '{hi} 00:00:00' GROUP BY CODE")
+    df=df.merge(pb,on="CODE",how="left")
     df["rank_up"]=df["RANK_1y"]-df["RANK0"]
-    df["fund_z"]=pd.concat([z(df["rev_yoy"]),z(df["rev_accel"]),z(df["ttm_g"]),z(df["margin_trend"])],axis=1).mean(axis=1).round(2)  # 매출YoY+가속+TTM성장+마진추세, NaN안전
+    _zs=[z(df["rev_yoy"]),z(df["rev_accel"]),z(df["ttm_g"]),z(df["margin_trend"])]
+    df["fund_gate_z"]=pd.concat(_zs,axis=1).mean(axis=1).round(2)                       # 성장 4팩터 = Track B 게이트용(신흥 턴어라운드 안 죽임)
+    df["fund_z"]=pd.concat(_zs+[z(df["recent_consist"])],axis=1).mean(axis=1).round(2)  # +최근꾸준 = 순위/표시용(꾸준한 놈 가점)
+    # 단발 스파이크: 큰 QoQ 점프는 있었지만 2분기 연속 성장이 아닌 것 = 반짝(바이오 마일스톤·M&A착시). 표시용 fund_z는 두고 순위만 강등.
+    df["is_spike"]=((df["rev_jump"]>=80)&(df["rev_streak"].fillna(0)<2)).astype(int)
+    df["fund_rank_key"]=df["fund_z"]-df["is_spike"]*1000
     df["emrg_z"]=z(df["rank_up"]).round(2)
     df["MC0_B"]=(df["MC0"]/1e9).round(1)
     # 밸류에이션 프록시: 시총 ÷ TTM영업이익(배). 시클리컬은 '피크 이익' 위라 이게 낮아 보이는 게 함정(피터 린치).
     df["p_op"]=np.where((df["ttm_op"].astype(float)>0), (df["MC0"].astype(float)/df["ttm_op"].astype(float)).round(1), np.nan)
-    # Track A: 펀더멘털 가속 순위
-    df["trackA_rank"]=df["fund_z"].rank(ascending=False,method="min").astype(int)
+    # Track A: 펀더멘털 가속 순위 (단발 스파이크는 fund_rank_key로 뒤로 밀림)
+    df["trackA_rank"]=df["fund_rank_key"].rank(ascending=False,method="min").astype(int)
     # Track B: AND게이트(순위상승>0 & 펀더+) + 대형 제외 후 하이브리드
-    gate=(df["rank_up"]>0)&(df["fund_z"]>0)&(df["RANK0"]>20)
+    gate=(df["rank_up"]>0)&(df["fund_gate_z"]>0)&(df["RANK0"]>20)
     df["hybrid"]=((df["fund_z"]+df["emrg_z"])/2).round(2)
     df["trackB_pass"]=gate
-    tb=df[gate].sort_values("hybrid",ascending=False).reset_index(drop=True)
+    tb=df[gate].sort_values(["is_spike","hybrid"],ascending=[True,False]).reset_index(drop=True)
     tb["trackB_rank"]=tb.index+1
     df=df.merge(tb[["CODE","trackB_rank"]],on="CODE",how="left")
     return df
@@ -170,9 +196,9 @@ def screen_now():
     # A) 매출·마진 팩터가 안 맞는 섹터 제외: 부동산 리츠(임대수익 구조라 매출/영업이익 개념이 다름)
     df=df[df["섹터"]!="부동산"].copy()
     # 제외 후 순위 다시 매김(Track A = 펀더점수, Track B = 종합점수)
-    df["trackA_rank"]=df["fund_z"].rank(ascending=False,method="min").astype(int)
+    df["trackA_rank"]=df["fund_rank_key"].rank(ascending=False,method="min").astype(int)
     df=df.drop(columns=["trackB_rank"])
-    _tb=df[df["trackB_pass"]].sort_values("hybrid",ascending=False).reset_index(drop=True)
+    _tb=df[df["trackB_pass"]].sort_values(["is_spike","hybrid"],ascending=[True,False]).reset_index(drop=True)
     _tb["trackB_rank"]=_tb.index+1
     df=df.merge(_tb[["CODE","trackB_rank"]],on="CODE",how="left")
     def _typ(r):
@@ -190,18 +216,21 @@ def screen_now():
         if typ=="시클리컬" and mp==mp:
             if mp>=80 and ((dd==dd and dd<=-25) or hl==1): notes.append("지금 이익 최고 → 떨어질 수 있음")
             elif mp<=30: notes.append("지금 이익 바닥 → 반등할지 확인")
-        if rj==rj and rj>=80: notes.append("매출이 한번에 확 뜀 → 합병·분사·상장초기인지 확인(진짜 성장 아닐 수 있음)")
+        st=r.get("rev_streak")
+        # 매출 급증이 '여러 분기 지속(램프)'이면 진짜 성장 → 경고 안 붙임. '한 분기 반짝'만 경고.
+        if rj==rj and rj>=80 and not (st==st and st>=2):
+            notes.append("매출이 한 분기만 반짝 → 단발 이벤트·합병·상장초기인지 확인(지속 성장 아닐 수 있음)")
         return " / ".join(notes)
     df["주의"]=df.apply(_warn,axis=1)
-    df["netier"]=[entry_tier(r0,r1) for r0,r1 in zip(df["RANK0"],df["RANK_1y"])]
-    acol=["trackA_rank","CODE","NAME","섹터","유형","주의","MC0_B","RANK0","rev_yoy","margin_trend","margin_std","margin_pos","margin_dd","p_op","pos_ratio","fund_z","vol_ann"]
-    bcol=["trackB_rank","CODE","NAME","MC0_B","RANK0","rank_up","fund_z","hybrid","vol_ann","mdd_1y"]
+    df["netier"]=[entry_tier(r0,rpb) for r0,rpb in zip(df["RANK0"],df["RANK_PB"])]
+    acol=["trackA_rank","CODE","NAME","섹터","유형","주의","MC0_B","RANK0","rev_yoy","rev_streak","recent_consist","margin_trend","margin_std","margin_pos","margin_dd","p_op","pos_ratio","fund_z","vol_ann"]
+    bcol=["trackB_rank","CODE","NAME","MC0_B","RANK0","rank_up","rev_streak","recent_consist","fund_z","hybrid","vol_ann","mdd_1y"]
     a=df.sort_values("trackA_rank")[acol].head(20)
     b=df[df["trackB_pass"]].sort_values("trackB_rank")[bcol]
-    ne=df[df["netier"].notna()].sort_values(["netier","fund_z"],ascending=[True,False]).copy()
+    ne=df[df["netier"].notna()].sort_values(["netier","fund_rank_key"],ascending=[True,False]).copy()
     ne["신규진입"]=ne["netier"].astype(int).map(lambda t:str(t)+"위내진입")
-    ne=ne[["신규진입","CODE","NAME","섹터","유형","주의","MC0_B","RANK0","rank_up","fund_z","margin_std","margin_pos","margin_dd","vol_ann"]]
-    KOR={"trackA_rank":"순위","trackB_rank":"순위","CODE":"티커","NAME":"종목명","MC0_B":"시총(십억$)","RANK0":"시총순위","RANK_1y":"1년전순위","rev_yoy":"매출증가율%","rev_accel":"매출가속도","ttm_g":"연간매출성장%","margin_trend":"영업마진추세%p","margin_std":"마진변동성%p","margin_pos":"마진위치%","margin_dd":"예전 이익하락폭%p","p_op":"시총/영업이익(배)","margin_tcorr":"마진추세상관","pos_ratio":"성장지속%","fund_z":"펀더멘털점수","vol_ann":"주가변동성%","mdd_1y":"최대낙폭%","rank_up":"순위상승폭","hybrid":"종합점수"}
+    ne=ne[["신규진입","CODE","NAME","섹터","유형","주의","MC0_B","RANK0","rank_up","rev_streak","fund_z","margin_std","margin_pos","margin_dd","vol_ann"]]
+    KOR={"trackA_rank":"순위","trackB_rank":"순위","CODE":"티커","NAME":"종목명","MC0_B":"시총(십억$)","RANK0":"시총순위","RANK_1y":"1년전순위","rev_yoy":"매출증가율%","rev_streak":"매출연속성장(분기)","recent_consist":"최근꾸준%","rev_accel":"매출가속도","ttm_g":"연간매출성장%","margin_trend":"영업마진추세%p","margin_std":"마진변동성%p","margin_pos":"마진위치%","margin_dd":"예전 이익하락폭%p","p_op":"시총/영업이익(배)","margin_tcorr":"마진추세상관","pos_ratio":"성장지속%","fund_z":"펀더멘털점수","vol_ann":"주가변동성%","mdd_1y":"최대낙폭%","rank_up":"순위상승폭","hybrid":"종합점수"}
     a=a.rename(columns=KOR); b=b.rename(columns=KOR); ne=ne.rename(columns=KOR)
     out="/data/frame/leader_watchlist_latest.xlsx"
     with pd.ExcelWriter(out,engine="openpyxl") as w:
