@@ -11,6 +11,7 @@ import json
 import time
 import logging
 from datetime import datetime
+import tb_conn  # 포트를 tip에서 자동 해결 (하드코딩 제거)
 
 logging.basicConfig(
     filename="/tmp/etl_quarterly_sec.log",
@@ -89,19 +90,23 @@ def main():
     # ── DB 연결 ──────────────────────────────────────────────
     conn = jaydebeapi.connect(
         'com.tmax.tibero.jdbc.TbDriver',
-        'jdbc:tibero:thin:@localhost:44123:tibero',
+        tb_conn.URL,
         [os.environ.get('TIBERO_USER', 'sys'), os.environ.get('TIBERO_PASS', '')],
         '/data/tibero7/tibero7/client/lib/jar/tibero7-jdbc.jar'
     )
     conn.jconn.setAutoCommit(False)
     cur = conn.cursor()
 
-    # ── Top 100 유니버스 조회 ─────────────────────────────────
-    cur.execute("""
+    # ── 유니버스 조회 ─────────────────────────────────────────
+    # 예전엔 시총 상위 100개만 가져왔음(FETCH FIRST 100). 유니버스 확장 1단계로
+    # 가격 있는 종목 전체(현재 ~524종)의 재무를 채운다. 환경변수 SEC_LIMIT로 상한 조절 가능(기본=전체).
+    limit = os.environ.get("SEC_LIMIT", "").strip()
+    limit_sql = f"FETCH FIRST {int(limit)} ROWS ONLY" if limit.isdigit() else ""
+    cur.execute(f"""
         SELECT code FROM daily_marcap_us
         WHERE date_ = (SELECT MAX(date_) FROM daily_marcap_us)
         ORDER BY marcap DESC
-        FETCH FIRST 100 ROWS ONLY
+        {limit_sql}
     """)
     universe = [r[0] for r in cur.fetchall()]
     log.info(f"유니버스 {len(universe)}종목")

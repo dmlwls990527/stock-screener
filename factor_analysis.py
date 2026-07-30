@@ -20,6 +20,7 @@ Factor 2 : 거래대금 증가율 (QoQ %)
 """
 
 from __future__ import annotations
+import tb_conn  # 포트를 tip에서 자동 해결 (하드코딩 제거)
 
 import sys
 import os
@@ -44,7 +45,7 @@ except ImportError:
 
 # DB 설정
 TIBERO_HOST = "localhost"
-TIBERO_PORT = 44123
+TIBERO_PORT = tb_conn.PORT
 TIBERO_SID  = "tibero"
 TIBERO_USER = os.environ.get("TIBERO_USER", "sys")
 TIBERO_PASS = os.environ.get("TIBERO_PASS", "")

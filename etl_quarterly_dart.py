@@ -22,10 +22,11 @@ import json
 import xml.etree.ElementTree as ET
 import urllib.request
 import jaydebeapi
+import tb_conn  # 포트를 tip에서 자동 해결 (하드코딩 제거)
 
 DART_KEY = __import__("os").environ["DART_API_KEY"]
 JAR = "/data/tibero7/tibero7/client/lib/jar/tibero7-jdbc.jar"
-URL = "jdbc:tibero:thin:@localhost:44123:tibero"
+URL = tb_conn.URL
 DELAY = 0.15
 
 START_YEAR = 2018

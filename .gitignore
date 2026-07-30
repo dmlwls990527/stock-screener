@@ -33,3 +33,6 @@ xlsx_old_*/
 
 # manual backup snapshots (superseded by git history going forward)
 *.bak_*
+.port_bak_*/
+.tbconn_bak_*/
+db_backup_archive/

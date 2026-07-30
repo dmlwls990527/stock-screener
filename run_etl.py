@@ -12,6 +12,7 @@ KR + US DB 적재 통합 스크립트
   python3 run_etl.py --us     # 미장만
 """
 
+import tb_conn  # 포트를 tip에서 자동 해결 (하드코딩 제거)
 import os
 import sys
 import time
@@ -28,7 +29,7 @@ except ImportError:
 
 # ── DB 설정 ───────────────────────────────────────────────────
 TIBERO_HOST = "localhost"
-TIBERO_PORT = 44123
+TIBERO_PORT = tb_conn.PORT
 TIBERO_SID  = "tibero"
 TIBERO_USER = os.environ.get("TIBERO_USER", "sys")
 TIBERO_PASS = os.environ.get("TIBERO_PASS", "")

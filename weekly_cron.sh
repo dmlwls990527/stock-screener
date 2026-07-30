@@ -16,4 +16,9 @@ echo "--- 구형 스크리너 (momentum/paradigm/sector/theme/monthly) ---" >> "
 ./.venv/bin/python screen.py theme-daily >> "$LOG" 2>&1
 ./.venv/bin/python sector_dashboard.py >> "$LOG" 2>&1
 
+
+# --- DB 스냅샷 백업 (Tibero 재설치 사고 대비 — 2026-07 3주 유실 재발 방지) ---
+echo "--- DB 백업 ---" >> "$LOG"
+./.venv/bin/python db_backup.py >> "$LOG" 2>&1 && echo "백업 OK: $(du -sh /data/frame/db_backup | cut -f1)" >> "$LOG"
+
 echo "=== $(date) 완료 ===" >> "$LOG"

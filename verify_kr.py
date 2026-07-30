@@ -3,8 +3,9 @@
 """KR 백필 완료 후 품질 검증 (백업 전 최종 체크)."""
 import os
 import jaydebeapi
+import tb_conn  # 포트를 tip에서 자동 해결 (하드코딩 제거)
 
-URL = "jdbc:tibero:thin:@localhost:44123:tibero"
+URL = tb_conn.URL
 JAR = "/data/tibero7/tibero7/client/lib/jar/tibero7-jdbc.jar"
 
 conn = jaydebeapi.connect("com.tmax.tibero.jdbc.TbDriver", URL, [os.environ.get("TIBERO_USER", "sys"), os.environ.get("TIBERO_PASS", "")], JAR)

@@ -10,6 +10,7 @@ yfinance ticker.info 사용 — 오늘 기준 현재 값
   python3 etl_fundamental_us.py
 """
 
+import tb_conn  # 포트를 tip에서 자동 해결 (하드코딩 제거)
 import os
 import sys
 import time
@@ -25,7 +26,7 @@ except ImportError:
     sys.exit(1)
 
 TIBERO_HOST = "localhost"
-TIBERO_PORT = 44123
+TIBERO_PORT = tb_conn.PORT
 TIBERO_SID  = "tibero"
 TIBERO_USER = os.environ.get("TIBERO_USER", "sys")
 TIBERO_PASS = os.environ.get("TIBERO_PASS", "")

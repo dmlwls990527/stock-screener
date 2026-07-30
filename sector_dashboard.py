@@ -22,8 +22,9 @@ import numpy as np
 import pandas as pd
 import jaydebeapi as j
 from openpyxl.chart import BarChart, LineChart, Reference
+import tb_conn  # 포트를 tip에서 자동 해결 (하드코딩 제거)
 
-TIBERO_URL = "jdbc:tibero:thin:@localhost:44123:tibero"
+TIBERO_URL = tb_conn.URL
 JDBC_JAR   = "/data/tibero7/tibero7/client/lib/jar/tibero7-jdbc.jar"
 SS_PATH    = "/data/frame/screen.py"
 JO = 1e12   # 조원
