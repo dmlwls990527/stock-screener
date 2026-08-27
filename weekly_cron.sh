@@ -21,4 +21,9 @@ echo "--- 구형 스크리너 (momentum/paradigm/sector/theme/monthly) ---" >> "
 echo "--- DB 백업 ---" >> "$LOG"
 ./.venv/bin/python db_backup.py >> "$LOG" 2>&1 && echo "백업 OK: $(du -sh /data/frame/db_backup | cut -f1)" >> "$LOG"
 
+
+# --- 미국 주도주 리스트를 GitHub에 주간 보관 (주도주 엑셀만) ---
+echo "--- 주도주 리스트 GitHub push ---" >> "$LOG"
+bash /data/frame/push_watchlist.sh >> "$LOG" 2>&1
+
 echo "=== $(date) 완료 ===" >> "$LOG"
