@@ -4,6 +4,7 @@
 db_backup.py — 주식 테이블(미장 5개 + 국장 5개)을 CSV.gz로 덤프 (Tibero 재설치 사고 대비).
 복원: create_tables_us.py/create_tables_kr.py로 테이블 만든 뒤 db_restore.py로 적재.
 """
+import tb_conn  # 포트를 tip에서 자동 해결 (하드코딩 제거)
 import os
 import csv, gzip, os
 import jaydebeapi as j
@@ -43,7 +44,6 @@ HEADERS = {
 # --- 안전장치: 지금 DB가 정상인지 먼저 확인. 비정상이면 기존 백업을 덮지 않는다 ---
 # (2026-07-30: 서버 재설치로 3주 유실. 복구 도중 크론이 돌아 반쪽 DB가 정상 백업을 덮는 사고 방지)
 import json, shutil, datetime, sys
-import tb_conn  # 포트를 tip에서 자동 해결 (하드코딩 제거)
 ARCH = "/data/frame/db_backup_archive"
 os.makedirs(ARCH, exist_ok=True)
 FORCE = "--force" in sys.argv

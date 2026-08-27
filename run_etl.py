@@ -62,6 +62,22 @@ def to_float(val):
         return None
 
 
+def to_int(val):
+    """NaN/None/빈값을 안전하게 None으로. int(NaN)이 ValueError를 던져
+    그 날짜 적재 전체가 롤백되던 문제(2026-08-17/18 신규 0일) 대응.
+    주의: NaN은 truthy라서 `if val` 검사로는 못 걸러진다."""
+    try:
+        if val is None:
+            return None
+        if isinstance(val, float) and pd.isna(val):
+            return None
+        if pd.isna(val):
+            return None
+        return int(val)
+    except Exception:
+        return None
+
+
 # ═══════════════════════════════════════════════════════════════
 # 국장 (KR) — pykrx → Tibero
 # ═══════════════════════════════════════════════════════════════
@@ -140,8 +156,8 @@ def run_kr_etl(start: str = "20160101"):
                     VALUES (TO_DATE(?, 'YYYYMMDD'), ?, ?, ?, ?, ?, ?, ?, ?)"""
                 for r in df_p.itertuples(index=False):
                     cur.execute(sql, [ds, r.code,
-                        int(r.open), int(r.high), int(r.low), int(r.close),
-                        int(r.volume), int(r.amount),
+                        to_int(r.open), to_int(r.high), to_int(r.low), to_int(r.close),
+                        to_int(r.volume), to_int(r.amount),
                         float(r.changes_ratio) if not pd.isna(r.changes_ratio) else None])
                 n1 = len(df_p)
 
@@ -169,9 +185,9 @@ def run_kr_etl(start: str = "20160101"):
                         VALUES (TO_DATE(?, 'YYYYMMDD'), ?, ?, ?, ?, ?, ?, ?)"""
                     for r in df_m.itertuples(index=False):
                         cur.execute(sql, [ds, r.code,
-                            int(r.close), int(r.marcap),
-                            int(r.volume), int(r.amount),
-                            int(r.stocks), int(r.rank)])
+                            to_int(r.close), to_int(r.marcap),
+                            to_int(r.volume), to_int(r.amount),
+                            to_int(r.stocks), to_int(r.rank)])
                     n2 = len(df_m)
 
                 # daily_fundamental
@@ -445,15 +461,27 @@ def run_us_etl(start: str = "2016-01-01", force: bool = False):
             sql_p = """INSERT INTO daily_price_us
                 (date_, code, open, high, low, close, volume, amount, changes_ratio)
                 VALUES (TO_DATE(?, 'YYYY-MM-DD'), ?, ?, ?, ?, ?, ?, ?, ?)"""
+            bad_p = []
+            n1 = 0
             for r in df_day.itertuples(index=False):
-                cur.execute(sql_p, [
+                params = [
                     r.date_str, r.code,
                     to_float(r.open), to_float(r.high),
-                    to_float(r.low),  float(r.close),
-                    int(r.volume),    to_float(r.amount),
+                    to_float(r.low),  to_float(r.close),
+                    to_int(r.volume),  to_float(r.amount),
                     to_float(r.changes_ratio)
-                ])
-            n1 = len(df_day)
+                ]
+                try:
+                    cur.execute(sql_p, params)
+                    n1 += 1
+                except Exception as re_:
+                    # 한 종목 때문에 그날 전체가 롤백되던 문제 -> 불량 행만 건너뛴다.
+                    bad_p.append((r.code, params, str(re_)[:60]))
+            if bad_p:
+                print("")
+                print("    [price] 불량 %d행 스킵. 예시:" % len(bad_p))
+                for code, params, msg in bad_p[:3]:
+                    print("      %s: %s <- %s" % (code, [(type(v).__name__, repr(v)[:22]) for v in params], msg))
 
             # daily_marcap_us
             marcap_rows = []
@@ -471,13 +499,24 @@ def run_us_etl(start: str = "2016-01-01", force: bool = False):
             sql_m = """INSERT INTO daily_marcap_us
                 (date_, code, close, marcap, stocks, rank)
                 VALUES (TO_DATE(?, 'YYYY-MM-DD'), ?, ?, ?, ?, ?)"""
+            bad_m = []
+            n2 = 0
             for r in mdf.itertuples(index=False):
-                cur.execute(sql_m, [
-                    r.date_str, r.code, r.close, r.marcap,
-                    int(r.stocks) if r.stocks else None,
-                    int(r.rank)   if r.rank   else None
-                ])
-            n2 = len(mdf)
+                params = [
+                    r.date_str, r.code, to_float(r.close), to_float(r.marcap),
+                    to_int(r.stocks),
+                    to_int(r.rank)
+                ]
+                try:
+                    cur.execute(sql_m, params)
+                    n2 += 1
+                except Exception as re_:
+                    bad_m.append((r.code, params, str(re_)[:60]))
+            if bad_m:
+                print("")
+                print("    [marcap] 불량 %d행 스킵. 예시:" % len(bad_m))
+                for code, params, msg in bad_m[:3]:
+                    print("      %s: %s <- %s" % (code, [(type(v).__name__, repr(v)[:22]) for v in params], msg))
 
             # daily_fundamental_us (오늘 1회만)
             n3 = 0

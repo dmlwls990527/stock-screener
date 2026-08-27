@@ -185,6 +185,89 @@ def entry_tier(r0,r1):
         if r0<=T and r1>T: return T
     return np.nan
 
+# ── Track C: 주도주(시장을 끌고 가는 주식) ────────────────────────────────
+# Track A/B는 "매출이 빠르게 크는 종목"만 봐서, 기관이 담을 수도 없는 소형주가
+# 상위에 올랐다(예: 일거래대금 43M$인 종목이 2위). 주도주는 정의상
+#   ① 시장보다 세게 오르고(상대강도) ② 기관이 들어올 수 있는 규모·유동성이 있고
+#   ③ 신고가 근처에서 움직이며 ④ 섹터 안에서 앞선다.
+# 그래서 가격·유동성 게이트를 따로 세운 트랙을 만든다. A/B와 병행(대체 아님).
+LEAD_MC_MIN   = 10e9    # 최소 시총 $10B — 이보다 작으면 시장을 주도할 체급이 안 됨
+LEAD_AMT_MIN  = 300e6   # 최소 일평균 거래대금 $300M — 기관 진입 가능성
+LEAD_RS_MIN   = 80      # 상대강도 상위 20%
+LEAD_HIGH_MIN = 85      # 52주 고점의 85% 이상 (고점 근처에서 버티는 중)
+
+def price_metrics(asof):
+    """유니버스 전체의 가격·유동성 지표. 상대강도(RS) 백분위 계산에 전 종목이 필요하다."""
+    d=dq(f"""SELECT CODE, TO_CHAR(date_,'YYYY-MM-DD') AS D, CLOSE AS C, HIGH AS H, AMOUNT AS A
+             FROM daily_price_us
+             WHERE date_ <= TIMESTAMP '{asof} 00:00:00'
+               AND date_ >  (SELECT MAX(date_)-420 FROM daily_price_us WHERE date_ <= TIMESTAMP '{asof} 00:00:00')""")
+    rows=[]
+    for code,g in d.groupby("CODE"):
+        g=g.sort_values("D")
+        cl=pd.to_numeric(g["C"],errors="coerce").values
+        hi=pd.to_numeric(g["H"],errors="coerce").values
+        am=pd.to_numeric(g["A"],errors="coerce").values
+        cl=cl[np.isfinite(cl)&(cl>0)]
+        if len(cl)<120: continue
+        # 분할 아티팩트(하루 ±50% 초과) 제거 후 누적수익률 — add_vol과 동일한 가드
+        r=np.diff(np.log(cl)); r=r[np.abs(r)<np.log(1.5)]
+        def cum(n):
+            if len(r)<n*0.6: return np.nan
+            return (np.exp(r[-n:].sum())-1)*100
+        hh=np.nanmax(hi[-252:]) if np.isfinite(hi[-252:]).any() else np.nanmax(cl[-252:])
+        rows.append(dict(CODE=code,
+            ret_12m=cum(252), ret_6m=cum(126), ret_3m=cum(63),
+            near_high=round(cl[-1]/hh*100,1) if hh and hh>0 else np.nan,
+            amt20=float(np.nanmean(am[-20:])) if len(am)>=20 else np.nan,
+            amt_grow=round((np.nanmean(am[-20:])/np.nanmean(am[-80:-20])-1)*100) \
+                     if (len(am)>=80 and np.nanmean(am[-80:-20])>0) else np.nan))
+    p=pd.DataFrame(rows)
+    if p.empty: return p
+    # RS = 기간별 수익률의 '유니버스 내 백분위'를 가중 평균 (오닐식 12/6/3개월 배합).
+    # 절대 수익률을 그대로 합치면 한 기간의 이상치가 전부를 좌우하므로 백분위로 바꿔서 섞는다.
+    def pct(s): return s.rank(pct=True)*100
+    w={"ret_12m":0.4,"ret_6m":0.3,"ret_3m":0.3}
+    acc=None; wsum=None
+    for c,wt in w.items():
+        pc=pct(p[c]); m=pc.notna()
+        acc=(pc.fillna(0)*wt) if acc is None else acc+(pc.fillna(0)*wt)
+        wsum=(m*wt) if wsum is None else wsum+(m*wt)
+    p["rs_pct"]=(acc/wsum.replace(0,np.nan)).round(1)
+    p["amt20_m"]=(p["amt20"]/1e6).round(0)
+    return p
+
+def build_leaders(df):
+    """Track C 판정. df는 screen_now에서 만든 (재무+시총+섹터) 테이블."""
+    if "rs_pct" not in df.columns: return df, pd.DataFrame()
+    mc=df["MC0"].astype(float)
+    # 단발 스파이크(한 분기만 매출이 튄 종목)는 주도주가 아니다 -> 게이트에서 제외.
+    # Track A/B에는 이 강등이 있었는데 Track C에만 빠져 MRNA가 1위로 올라왔었다.
+    spike=df["is_spike"].fillna(0).astype(int)==1 if "is_spike" in df.columns else pd.Series(False,index=df.index)
+    gate=(mc>=LEAD_MC_MIN)&(df["amt20"].astype(float)>=LEAD_AMT_MIN) \
+         &(df["rs_pct"]>=LEAD_RS_MIN)&(df["near_high"]>=LEAD_HIGH_MIN)&(~spike)
+    df["leader_pass"]=gate.fillna(False)
+    # 섹터 리더십: 체급($10B+) 안에서 같은 섹터끼리 상대강도 순위
+    big=df[mc>=LEAD_MC_MIN].copy()
+    big["sec_rank"]=big.groupby("섹터")["rs_pct"].rank(ascending=False,method="min")
+    df=df.merge(big[["CODE","sec_rank"]],on="CODE",how="left")
+    # 점수: 상대강도 + 실적가속 + 거래대금 증가 (+ 섹터 1·2위 가점)
+    # 점수는 z가 아니라 '유니버스 내 백분위' 배합. z는 극단값 한 종목이 점수를 지배해
+    # (MRNA 7.21 vs 2위 1.40) 순위가 왜곡됐다. RS 계산과 같은 방식으로 통일.
+    def _blend(pairs):
+        acc=wsum=None
+        for cname,wt in pairs:
+            pc=df[cname].rank(pct=True)*100; m=pc.notna()
+            acc=pc.fillna(0)*wt if acc is None else acc+pc.fillna(0)*wt
+            wsum=m*wt if wsum is None else wsum+m*wt
+        return acc/wsum.replace(0,np.nan)
+    sc=_blend([("rs_pct",0.4),("fund_z",0.3),("amt_grow",0.3)])/100
+    df["lead_score"]=(sc+np.where(df["sec_rank"].fillna(99)<=2,0.10,0)).round(3)
+    lead=df[df["leader_pass"]].sort_values("lead_score",ascending=False).reset_index(drop=True)
+    lead["leader_rank"]=lead.index+1
+    df=df.merge(lead[["CODE","leader_rank"]],on="CODE",how="left")
+    return df, lead
+
 def screen_now():
     today=dq("SELECT TO_CHAR(MAX(date_),'YYYY-MM-DD') D FROM daily_marcap_us")["D"].iloc[0]
     df=build(today); df=add_vol(df)
@@ -195,6 +278,8 @@ def screen_now():
     df["섹터"]=df["CODE"].map(lambda c:SKO.get(sec.get(c,""),(sec.get(c,"") or "?")))
     # A) 매출·마진 팩터가 안 맞는 섹터 제외: 부동산 리츠(임대수익 구조라 매출/영업이익 개념이 다름)
     df=df[df["섹터"]!="부동산"].copy()
+    # Track C용 가격·유동성 지표 (유니버스 전체 기준으로 RS 백분위 계산 후 병합)
+    df=df.merge(price_metrics(today),on="CODE",how="left")
     # 제외 후 순위 다시 매김(Track A = 펀더점수, Track B = 종합점수)
     df["trackA_rank"]=df["fund_rank_key"].rank(ascending=False,method="min").astype(int)
     df=df.drop(columns=["trackB_rank"])
@@ -223,6 +308,8 @@ def screen_now():
         return " / ".join(notes)
     df["주의"]=df.apply(_warn,axis=1)
     df["netier"]=[entry_tier(r0,rpb) for r0,rpb in zip(df["RANK0"],df["RANK_PB"])]
+    df,lead=build_leaders(df)   # Track C
+    ccol=["leader_rank","CODE","NAME","섹터","유형","주의","MC0_B","RANK0","rs_pct","near_high","amt20_m","amt_grow","sec_rank","rev_streak","recent_consist","fund_z","lead_score","vol_ann","mdd_1y"]
     acol=["trackA_rank","CODE","NAME","섹터","유형","주의","MC0_B","RANK0","rev_yoy","rev_streak","recent_consist","margin_trend","margin_std","margin_pos","margin_dd","p_op","pos_ratio","fund_z","vol_ann"]
     bcol=["trackB_rank","CODE","NAME","MC0_B","RANK0","rank_up","rev_streak","recent_consist","fund_z","hybrid","vol_ann","mdd_1y"]
     a=df.sort_values("trackA_rank")[acol].head(20)
@@ -230,15 +317,23 @@ def screen_now():
     ne=df[df["netier"].notna()].sort_values(["netier","fund_rank_key"],ascending=[True,False]).copy()
     ne["신규진입"]=ne["netier"].astype(int).map(lambda t:str(t)+"위내진입")
     ne=ne[["신규진입","CODE","NAME","섹터","유형","주의","MC0_B","RANK0","rank_up","rev_streak","fund_z","margin_std","margin_pos","margin_dd","vol_ann"]]
-    KOR={"trackA_rank":"순위","trackB_rank":"순위","CODE":"티커","NAME":"종목명","MC0_B":"시총(십억$)","RANK0":"시총순위","RANK_1y":"1년전순위","rev_yoy":"매출증가율%","rev_streak":"매출연속성장(분기)","recent_consist":"최근꾸준%","rev_accel":"매출가속도","ttm_g":"연간매출성장%","margin_trend":"영업마진추세%p","margin_std":"마진변동성%p","margin_pos":"마진위치%","margin_dd":"예전 이익하락폭%p","p_op":"시총/영업이익(배)","margin_tcorr":"마진추세상관","pos_ratio":"성장지속%","fund_z":"펀더멘털점수","vol_ann":"주가변동성%","mdd_1y":"최대낙폭%","rank_up":"순위상승폭","hybrid":"종합점수"}
+    KOR={"trackA_rank":"순위","trackB_rank":"순위","leader_rank":"순위","CODE":"티커","NAME":"종목명","MC0_B":"시총(십억$)","RANK0":"시총순위","RANK_1y":"1년전순위","rev_yoy":"매출증가율%","rev_streak":"매출연속성장(분기)","recent_consist":"최근꾸준%","rev_accel":"매출가속도","ttm_g":"연간매출성장%","margin_trend":"영업마진추세%p","margin_std":"마진변동성%p","margin_pos":"마진위치%","margin_dd":"예전 이익하락폭%p","p_op":"시총/영업이익(배)","margin_tcorr":"마진추세상관","pos_ratio":"성장지속%","fund_z":"펀더멘털점수","vol_ann":"주가변동성%","mdd_1y":"최대낙폭%","rank_up":"순위상승폭","hybrid":"종합점수","rs_pct":"상대강도(0~100)","near_high":"52주고점대비%","amt20_m":"일거래대금(백만$)","amt_grow":"거래대금증가%","sec_rank":"섹터내순위","lead_score":"주도주점수"}
+    cc=lead[ccol].rename(columns=KOR) if len(lead) else pd.DataFrame(columns=[KOR.get(c,c) for c in ccol])
     a=a.rename(columns=KOR); b=b.rename(columns=KOR); ne=ne.rename(columns=KOR)
     out="/data/frame/leader_watchlist_latest.xlsx"
     with pd.ExcelWriter(out,engine="openpyxl") as w:
+        cc.to_excel(w,sheet_name="주도주",index=False)
         ne.to_excel(w,sheet_name="신규진입",index=False)
         a.to_excel(w,sheet_name="펀더멘털가속",index=False)
         b.to_excel(w,sheet_name="순위상승",index=False)
-        pd.DataFrame({"항목":["기준일","유니버스","마진위치%","주의","예전 이익하락폭%p","시총/영업이익","변동성/MDD","한계"],
+        pd.DataFrame({"항목":["기준일","유니버스","시트 3개(주도주/펀더멘털가속/순위상승)","주도주 시트 기준","상대강도(0~100)","52주고점대비%","일거래대금","섹터내순위","마진위치%","주의","예전 이익하락폭%p","시총/영업이익","변동성/MDD","한계"],
             "값":[today,f"{len(df)}종(지금 살아있는 종목만)",
+                 "주도주=지금 시장을 끌고 가는 큰 종목 / 펀더멘털가속=실적이 빨리 크는 종목(작은 것 포함) / 순위상승=시총순위가 뛴 종목. 목적이 달라서 따로 본다. 두 시트에 같이 나오면 신호가 겹친 것",
+                 f"시총 {LEAD_MC_MIN/1e9:.0f}십억$ 이상 AND 일거래대금 {LEAD_AMT_MIN/1e6:.0f}백만$ 이상 AND 상대강도 상위 {100-LEAD_RS_MIN:.0f}% AND 52주고점의 {LEAD_HIGH_MIN}% 이상 — 넷 다 통과한 종목만",
+                 "다른 종목들과 비교해 주가가 얼마나 셌는지(100=가장 셈). 12개월40%+6개월30%+3개월30% 배합. 지수 데이터가 없어 '유니버스 안에서의 순위'로 계산",
+                 "지금 주가가 1년 최고가의 몇 %인지. 100에 가까우면 신고가 근처",
+                 "최근 20일 하루 평균 거래된 금액. 기관이 사고팔 수 있는 크기인지 보는 값",
+                 "같은 섹터 큰 종목들($10십억$ 이상) 중 상대강도 몇 번째인지. 1~2위면 그 업종의 대장",
                  "지금 이익률이 최근 5년 최고~최저 중 어디쯤(100=제일 잘 벌 때, 0=제일 못 벌 때). 앞일을 맞히는 게 아니라 지금 위치만",
                  "확정 아님, '이럴 수도 있다'는 표시. 예전에 이익이 크게 꺾인 적 있는 경기민감주가 지금 최고면 '떨어질 수 있음', 지금 바닥이면 '반등할지 확인'",
                  "예전에 이익이 제일 크게 꺾였던 폭. 클수록 한 번 크게 무너진 적 있다는 뜻",
@@ -246,6 +341,8 @@ def screen_now():
                  "주가 출렁임%·고점 대비 최대하락%=참고용(거르는 데 안 씀), 얼마나 담을지 정할 때만",
                  "이건 '후보 목록'이지 사라는 신호가 아님. 앞일 맞히는 것도 아님. 나눠서 조금씩이 전제"]}).to_excel(w,sheet_name="설명",index=False)
     print(f"기준일 {today} | universe {len(df)}")
+    print(f"\n[Track C 주도주 ({len(lead)}종) — 시총≥{LEAD_MC_MIN/1e9:.0f}B·거래대금≥{LEAD_AMT_MIN/1e6:.0f}M·RS≥{LEAD_RS_MIN}·고점{LEAD_HIGH_MIN}%↑]")
+    print(cc.head(15).to_string(index=False) if len(cc) else "  (게이트 통과 종목 없음)")
     print(f"\n[신규 Top진입 ({len(ne)}종) — 최근1년 상위권 신규진입]"); print(ne.head(12).to_string(index=False))
     print("\n[Track A Top10]"); print(a.head(10).to_string(index=False))
     print("\n저장:",out)
