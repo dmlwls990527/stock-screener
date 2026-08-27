@@ -36,3 +36,7 @@ xlsx_old_*/
 .port_bak_*/
 .tbconn_bak_*/
 db_backup_archive/
+
+# 미국 주도주 리스트만 예외로 추적 (다른 산출물 엑셀은 계속 제외)
+!watchlist_us/
+!watchlist_us/*.xlsx
