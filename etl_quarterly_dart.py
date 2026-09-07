@@ -41,7 +41,43 @@ EQUITY_NAMES = ["자본총계"]
 LIAB_NAMES = ["부채총계"]
 
 
-def load_corp_code_map(path="/tmp/CORPCODE.xml"):
+# 예전엔 /tmp/CORPCODE.xml 을 수동으로 갖다 둬야 했다. /tmp 는 재부팅 때 비워지므로
+# 파일이 사라지면 스크립트가 FileNotFoundError 로 죽었고, 그래서 크론에 넣을 수 없었다.
+CORP_CODE_PATH = "/data/frame/cache/CORPCODE.xml"
+
+
+def ensure_corp_code_xml(path=CORP_CODE_PATH, max_age_days=30):
+    """DART corpCode.xml 을 확보한다(없거나 30일 넘게 묵었으면 다시 받음).
+    DART는 zip 으로 내려주므로 풀어서 저장한다. 신규 상장/코드 변경 반영도 겸한다."""
+    import zipfile
+    import io as _io
+
+    if os.path.exists(path) and (time.time() - os.path.getmtime(path)) < max_age_days * 86400:
+        return path
+
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    url = "https://opendart.fss.or.kr/api/corpCode.xml?crtfc_key=" + DART_KEY
+    print(f"  corpCode.xml 다운로드 중... -> {path}", flush=True)
+    with urllib.request.urlopen(url, timeout=120) as r:
+        blob = r.read()
+    try:
+        with zipfile.ZipFile(_io.BytesIO(blob)) as z:
+            name = next(n for n in z.namelist() if n.upper().endswith(".XML"))
+            data = z.read(name)
+    except zipfile.BadZipFile:
+        # 키가 틀리거나 한도 초과면 zip 대신 JSON 에러가 온다
+        raise RuntimeError("corpCode.xml 응답이 zip이 아님 (DART_API_KEY 확인): "
+                           + blob[:200].decode("utf-8", "replace"))
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(data)
+    os.replace(tmp, path)          # 중간에 끊겨도 반쪽 파일이 남지 않게 원자적 교체
+    print(f"  corpCode.xml 준비 완료 ({len(data):,} bytes)", flush=True)
+    return path
+
+
+def load_corp_code_map(path=CORP_CODE_PATH):
+    ensure_corp_code_xml(path)
     tree = ET.parse(path)
     m = {}
     for item in tree.getroot().findall("list"):
@@ -155,9 +191,24 @@ def main():
         if cc:
             corp_to_codes.setdefault(cc, []).append(code)
 
-    ins_sql = """INSERT INTO quarterly_financials_kr
-                 (code, end_date, revenue, op_income, net_income, total_equity, total_liabilities)
-                 VALUES (?, TO_DATE(?, 'YYYY-MM-DD'), ?, ?, ?, ?, ?)"""
+    # 단순 INSERT였을 때는 재실행 시 첫 중복 행에서 PK(CODE,END_DATE) 위반으로 스크립트가
+    # 통째로 죽었다. 그래서 이 스크립트는 사실상 1회용 로더였고, 국내 분기재무가
+    # 2026-03-31(1분기)에 멈춘 채 2분기가 통째로 비어 있었다.
+    # etl_quarterly_sec.py 와 같은 MERGE 방식으로 바꿔 매주 돌려도 안전하게 만든다.
+    ins_sql = """
+        MERGE INTO quarterly_financials_kr t
+        USING (SELECT ? AS code, TO_DATE(?, 'YYYY-MM-DD') AS end_date,
+                      ? AS revenue, ? AS op_income, ? AS net_income,
+                      ? AS total_equity, ? AS total_liabilities FROM dual) s
+        ON (t.code = s.code AND t.end_date = s.end_date)
+        WHEN MATCHED THEN
+            UPDATE SET revenue=s.revenue, op_income=s.op_income, net_income=s.net_income,
+                       total_equity=s.total_equity, total_liabilities=s.total_liabilities
+        WHEN NOT MATCHED THEN
+            INSERT (code, end_date, revenue, op_income, net_income, total_equity, total_liabilities)
+            VALUES (s.code, s.end_date, s.revenue, s.op_income, s.net_income,
+                    s.total_equity, s.total_liabilities)
+    """
 
     total_rows = 0
     n_corps = len(corp_to_codes)
@@ -171,11 +222,17 @@ def main():
                 if all(v is None for v in (rev, op, ni, eq, li)):
                     continue
                 rows_for_corp.append((end_date, rev, op, ni, eq, li))
+        bad = []
         for code in codes:
             for end_date, rev, op, ni, eq, li in rows_for_corp:
-                cur.execute(ins_sql, [code, end_date, rev, op, ni, eq, li])
-                total_rows += 1
+                try:
+                    cur.execute(ins_sql, [code, end_date, rev, op, ni, eq, li])
+                    total_rows += 1
+                except Exception as e:
+                    bad.append((code, end_date, str(e)[:60]))
         conn.commit()
+        if bad:
+            print(f"  !! {len(bad)}행 실패 (예: {bad[0]})", flush=True)
         print(f"  -> {len(rows_for_corp)}분기 x {len(codes)}종목 적재 (누적 {total_rows}행)", flush=True)
 
     cur.close()

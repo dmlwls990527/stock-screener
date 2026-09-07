@@ -40,3 +40,10 @@ db_backup_archive/
 # 미국 주도주 리스트만 예외로 추적 (다른 산출물 엑셀은 계속 제외)
 !watchlist_us/
 !watchlist_us/*.xlsx
+
+# DART corpCode.xml 캐시 (30MB, etl_quarterly_dart.py 가 자동으로 받음)
+cache/
+
+# 번호 붙은 수동 백업 (leader_screener.py.bak3 같은 것 — *.bak_* 패턴에 안 걸림)
+*.bak
+*.bak[0-9]*

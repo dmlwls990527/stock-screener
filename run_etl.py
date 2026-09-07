@@ -52,6 +52,32 @@ def get_loaded_dates(conn, table: str) -> set:
     return {r[0] for r in rows}
 
 
+def get_loaded_date_counts(conn, table: str) -> dict:
+    """날짜별 적재 행수. 날짜 '존재'만 보면 일부만 들어간 날을 정상으로 오인한다."""
+    cur = conn.cursor()
+    cur.execute(f"SELECT TO_CHAR(date_, 'YYYYMMDD'), COUNT(*) FROM {table} GROUP BY date_")
+    rows = cur.fetchall()
+    cur.close()
+    return {r[0]: int(r[1]) for r in rows}
+
+
+def find_thin_dates(loaded_cnt: dict, lookback_days: int = 400, ratio: float = 0.5) -> set:
+    """평소 행수의 ratio 미만인 '적재 실패한 날'을 골라낸다.
+    행 단위 예외처리(bad_p/bad_m)를 넣은 뒤로는 일부 종목만 실패해도 날짜가 살아남는데,
+    증분 스킵이 날짜 존재 여부만 봐서 그런 날이 영구히 구멍으로 남았다.
+    실제 사례: 2026-08-28(76행), 2026-09-02(6행) — 둘 다 평소 1,516행.
+    lookback으로 범위를 제한해 복구 중인 DB에서 전 이력 재다운로드가 터지는 걸 막는다."""
+    if not loaded_cnt:
+        return set()
+    cut = (pd.Timestamp.today() - pd.Timedelta(days=lookback_days)).strftime("%Y%m%d")
+    recent = {d: n for d, n in loaded_cnt.items() if d >= cut}
+    if len(recent) < 20:          # 표본이 적으면 판단 보류
+        return set()
+    vals = sorted(recent.values())
+    typ = vals[len(vals) // 2]    # 중위값
+    return {d for d, n in recent.items() if n < typ * ratio}
+
+
 def to_float(val):
     try:
         if val is None or (isinstance(val, float) and pd.isna(val)):
@@ -123,7 +149,10 @@ def run_kr_etl(start: str = "20160101"):
     loaded     = get_loaded_dates(conn, "daily_price")
     date_range = pd.bdate_range(start=start, end=end)
     total = len(date_range)
-    skipped = inserted = 0
+    # holiday: pykrx가 0행을 준 날(공휴일 등). 이 날은 DB에 안 들어가므로 다음 실행에서
+    # 또 '미적재'로 잡혀 재조회된다. 예전엔 이것까지 inserted로 세서 로그가
+    # "신규 170일"처럼 부풀려졌다(실제 신규 데이터는 1일).
+    skipped = inserted = holiday = 0
 
     print(f"[KR-2] 영업일 적재 — 총 {total}일 (기적재 {len(loaded)}일)")
     print("-" * 60)
@@ -220,7 +249,7 @@ def run_kr_etl(start: str = "20160101"):
             print(f"\n  [{ds}] 오류: {e}")
 
     print("-" * 60)
-    print(f"  KR 완료 — 신규:{inserted}일  스킵:{skipped}일")
+    print(f"  KR 완료 — 신규:{inserted}일  휴장(0행):{holiday}일  스킵:{skipped}일")
     print("=" * 60)
     conn.close()
 
@@ -352,9 +381,19 @@ def run_us_etl(start: str = "2016-01-01", force: bool = False):
     print(f"  → {len(universe)}개 완료\n")
 
     # ── OHLCV 벌크 다운로드 ──────────────────────────────────
-    loaded  = get_loaded_dates(conn, "daily_price_us")
+    loaded_cnt = get_loaded_date_counts(conn, "daily_price_us")
+    loaded     = set(loaded_cnt)
+    thin       = find_thin_dates(loaded_cnt)
+    if thin:
+        print(f"[US-2] 재적재 대상(행수 부족) {len(thin)}일: {', '.join(sorted(thin))}")
     if loaded and not force:
-        dl_start = (pd.Timestamp(max(loaded)) - pd.Timedelta(days=7)).strftime("%Y-%m-%d")
+        _from = pd.Timestamp(max(loaded)) - pd.Timedelta(days=7)
+        if thin:
+            # 구멍 난 날짜가 7일 창 밖이면 아예 안 받아와서 못 고친다 → 창을 넓힌다(최대 180일)
+            _from = min(_from, pd.Timestamp(min(thin)) - pd.Timedelta(days=1))
+            _floor = pd.Timestamp.today().normalize() - pd.Timedelta(days=180)
+            _from = max(_from, _floor)
+        dl_start = _from.strftime("%Y-%m-%d")
         print(f"[US-2] 일일 업데이트 모드 — {dl_start}부터 다운로드")
     else:
         dl_start = start
@@ -411,24 +450,14 @@ def run_us_etl(start: str = "2016-01-01", force: bool = False):
     print(f"  → 완료\n")
 
     # ── 펀더멘털 ─────────────────────────────────────────────
-    print(f"[US-4] 펀더멘털 조회 중... ({len(symbols)}종목)")
-    fund_rows = []
-    for i, sym in enumerate(symbols):
-        try:
-            info = yf.Ticker(sym).info
-            fund_rows.append({
-                "code": sym,
-                "per":  to_float(info.get("trailingPE")),
-                "pbr":  to_float(info.get("priceToBook")),
-                "div":  to_float(info.get("dividendYield")),
-                "eps":  to_float(info.get("trailingEps")),
-            })
-        except Exception:
-            pass
-        if (i + 1) % 100 == 0:
-            print(f"  {i+1}/{len(symbols)}")
-        time.sleep(0.1)
-    fund_df = pd.DataFrame(fund_rows)
+    # [US-4] 제거 (2026-09-07). 아래 적재 루프의 삽입 조건이 `date_str == today_str` 인데
+    # 미장 최신 거래일은 절대 크론 실행일(월요일)과 같을 수 없어(금요일 종가가 마지막)
+    # 이 단계가 매주 1,529종 yf.Ticker().info 를 20~30분 동안 호출하고는
+    # 결과를 한 줄도 저장하지 못하고 버리고 있었다. 실측: daily_fundamental_us 는
+    # 2026-06-11 / 07-07 두 날짜, 100행이 전부(그마저 etl_fundamental_us.py 가 넣은 것).
+    # PER/PBR/ROE/부채비율 등 10개 컬럼을 다 채우는 etl_fundamental_us.py 가
+    # 상위 100종을 담당하므로(주간 크론에 추가함) 여기서는 받지 않는다.
+    fund_df = pd.DataFrame()
     print(f"  → 완료\n")
 
     # ── 날짜별 DB 적재 ────────────────────────────────────────
@@ -443,7 +472,8 @@ def run_us_etl(start: str = "2016-01-01", force: bool = False):
     for i, date_str in enumerate(date_list):
         # 증분 모드에서만 이미 있는 날짜를 건너뜀. force면 전부 다시 적재(신규 종목이
         # 기존 날짜에도 들어가야 하므로 날짜 스킵을 끈다 — 이게 소형주가 안 들어오던 버그였음).
-        if (not force) and date_str.replace("-", "") in loaded:
+        _key = date_str.replace("-", "")
+        if (not force) and _key in loaded and _key not in thin:
             skipped += 1
             continue
 
@@ -453,7 +483,7 @@ def run_us_etl(start: str = "2016-01-01", force: bool = False):
 
         cur = conn.cursor()
         try:
-            if force:
+            if force or _key in thin:
                 # 그 날짜의 기존 행을 지우고 df_day(신규+기존 전 종목)를 다시 넣음 → 중복/PK충돌 방지
                 cur.execute("DELETE FROM daily_price_us  WHERE date_ = TO_DATE(?, 'YYYY-MM-DD')", [date_str])
                 cur.execute("DELETE FROM daily_marcap_us WHERE date_ = TO_DATE(?, 'YYYY-MM-DD')", [date_str])
