@@ -244,8 +244,15 @@ def build_leaders(df):
     # 단발 스파이크(한 분기만 매출이 튄 종목)는 주도주가 아니다 -> 게이트에서 제외.
     # Track A/B에는 이 강등이 있었는데 Track C에만 빠져 MRNA가 1위로 올라왔었다.
     spike=df["is_spike"].fillna(0).astype(int)==1 if "is_spike" in df.columns else pd.Series(False,index=df.index)
+    # 영업적자/재무없음 제외. p_op = 시총÷TTM영업이익 인데 ttm_op<=0 이면 NaN 이라
+    # notna() 하나로 '적자'와 '재무데이터 없음'을 같이 거른다.
+    # 이 조건이 없을 때 CRWD(TTM 영업이익 -0.24십억$, 영업마진 -2.3%, PER 4987)가
+    # 주도주 8위에 '마진확장' 라벨을 달고 올라왔고 CNC(-4.35십억$)는 '꾸준복리'로 분류됐다.
+    # 배수 상한은 일부러 두지 않는다 — 상한을 걸면 이익 정점의 경기민감주(NEM 9.8배,
+    # MPC 8.3배)만 싸 보여 살아남고 고성장주가 잘려, '사이클 무관'이라는 목적과 반대가 된다.
+    profitable=df["p_op"].notna() if "p_op" in df.columns else pd.Series(True,index=df.index)
     gate=(mc>=LEAD_MC_MIN)&(df["amt20"].astype(float)>=LEAD_AMT_MIN) \
-         &(df["rs_pct"]>=LEAD_RS_MIN)&(df["near_high"]>=LEAD_HIGH_MIN)&(~spike)
+         &(df["rs_pct"]>=LEAD_RS_MIN)&(df["near_high"]>=LEAD_HIGH_MIN)&(~spike)&profitable
     df["leader_pass"]=gate.fillna(False)
     # 섹터 리더십: 체급($10B+) 안에서 같은 섹터끼리 상대강도 순위
     big=df[mc>=LEAD_MC_MIN].copy()
@@ -309,7 +316,7 @@ def screen_now():
     df["주의"]=df.apply(_warn,axis=1)
     df["netier"]=[entry_tier(r0,rpb) for r0,rpb in zip(df["RANK0"],df["RANK_PB"])]
     df,lead=build_leaders(df)   # Track C
-    ccol=["leader_rank","CODE","NAME","섹터","유형","주의","MC0_B","RANK0","rs_pct","near_high","amt20_m","amt_grow","sec_rank","rev_streak","recent_consist","fund_z","lead_score","vol_ann","mdd_1y"]
+    ccol=["leader_rank","CODE","NAME","섹터","유형","주의","MC0_B","RANK0","rs_pct","near_high","amt20_m","amt_grow","sec_rank","rev_streak","recent_consist","p_op","fund_z","lead_score","vol_ann","mdd_1y"]
     acol=["trackA_rank","CODE","NAME","섹터","유형","주의","MC0_B","RANK0","rev_yoy","rev_streak","recent_consist","margin_trend","margin_std","margin_pos","margin_dd","p_op","pos_ratio","fund_z","vol_ann"]
     bcol=["trackB_rank","CODE","NAME","MC0_B","RANK0","rank_up","rev_streak","recent_consist","fund_z","hybrid","vol_ann","mdd_1y"]
     a=df.sort_values("trackA_rank")[acol].head(20)
@@ -329,7 +336,7 @@ def screen_now():
         pd.DataFrame({"항목":["기준일","유니버스","시트 3개(주도주/펀더멘털가속/순위상승)","주도주 시트 기준","상대강도(0~100)","52주고점대비%","일거래대금","섹터내순위","마진위치%","주의","예전 이익하락폭%p","시총/영업이익","변동성/MDD","한계"],
             "값":[today,f"{len(df)}종(지금 살아있는 종목만)",
                  "주도주=지금 시장을 끌고 가는 큰 종목 / 펀더멘털가속=실적이 빨리 크는 종목(작은 것 포함) / 순위상승=시총순위가 뛴 종목. 목적이 달라서 따로 본다. 두 시트에 같이 나오면 신호가 겹친 것",
-                 f"시총 {LEAD_MC_MIN/1e9:.0f}십억$ 이상 AND 일거래대금 {LEAD_AMT_MIN/1e6:.0f}백만$ 이상 AND 상대강도 상위 {100-LEAD_RS_MIN:.0f}% AND 52주고점의 {LEAD_HIGH_MIN}% 이상 — 넷 다 통과한 종목만",
+                 f"시총 {LEAD_MC_MIN/1e9:.0f}십억$ 이상 AND 일거래대금 {LEAD_AMT_MIN/1e6:.0f}백만$ 이상 AND 상대강도 상위 {100-LEAD_RS_MIN:.0f}% AND 52주고점의 {LEAD_HIGH_MIN}% 이상 AND TTM 영업이익 흑자 — 다섯 다 통과한 종목만. 배수(시총/영업이익) 상한은 두지 않음: 상한을 걸면 이익 정점의 경기민감주만 싸 보여 남는다",
                  "다른 종목들과 비교해 주가가 얼마나 셌는지(100=가장 셈). 12개월40%+6개월30%+3개월30% 배합. 지수 데이터가 없어 '유니버스 안에서의 순위'로 계산",
                  "지금 주가가 1년 최고가의 몇 %인지. 100에 가까우면 신고가 근처",
                  "최근 20일 하루 평균 거래된 금액. 기관이 사고팔 수 있는 크기인지 보는 값",
