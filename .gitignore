@@ -47,3 +47,9 @@ cache/
 # 번호 붙은 수동 백업 (leader_screener.py.bak3 같은 것 — *.bak_* 패턴에 안 걸림)
 *.bak
 *.bak[0-9]*
+
+# auto_buy 페이퍼 트레이딩: 가상 계좌 상태·계획·리플레이 캐시는 산출물 (git 밖)
+paper/
+# paper_report_latest.xlsx / paper_replay_latest.xlsx 도 산출물 (*.xlsx 규칙으로 이미 제외)
+# 설정 파일은 소스처럼 추적 (*.json 규칙의 예외)
+!auto_buy_config.json
