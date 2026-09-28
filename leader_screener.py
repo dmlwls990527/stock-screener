@@ -251,9 +251,21 @@ def build_leaders(df):
     # 배수 상한은 일부러 두지 않는다 — 상한을 걸면 이익 정점의 경기민감주(NEM 9.8배,
     # MPC 8.3배)만 싸 보여 살아남고 고성장주가 잘려, '사이클 무관'이라는 목적과 반대가 된다.
     profitable=df["p_op"].notna() if "p_op" in df.columns else pd.Series(True,index=df.index)
-    gate=(mc>=LEAD_MC_MIN)&(df["amt20"].astype(float)>=LEAD_AMT_MIN) \
-         &(df["rs_pct"]>=LEAD_RS_MIN)&(df["near_high"]>=LEAD_HIGH_MIN)&(~spike)&profitable
-    df["leader_pass"]=gate.fillna(False)
+    # 조건별 탈락 여부를 따로 남긴다. 전엔 gate 하나로 합쳐져서 HOOD·NVDA 같은 종목이
+    # 왜 주도주 시트에 없는지 파일만 봐선 알 수 없었다. 지표 계산 불가(NaN)는 탈락으로 친다.
+    # gate 는 이 표에서 파생시켜 '탈락사유'와 실제 판정이 절대 어긋나지 않게 한다.
+    fails={
+        "시총<10B":      ~(mc>=LEAD_MC_MIN),
+        "거래대금<300M":  ~(df["amt20"].astype(float)>=LEAD_AMT_MIN),
+        "RS<80":         ~(df["rs_pct"]>=LEAD_RS_MIN),
+        "고점85%미만":    ~(df["near_high"]>=LEAD_HIGH_MIN),
+        "단발스파이크":    spike.astype(bool),
+        "영업적자/무재무":  ~profitable,
+    }
+    fl=pd.DataFrame(fails).fillna(True)
+    df["탈락사유"]=fl.apply(lambda r: "통과" if not r.any() else ", ".join(k for k,v in r.items() if v), axis=1)
+    gate=~fl.any(axis=1)
+    df["leader_pass"]=gate
     # 섹터 리더십: 체급($10B+) 안에서 같은 섹터끼리 상대강도 순위
     big=df[mc>=LEAD_MC_MIN].copy()
     big["sec_rank"]=big.groupby("섹터")["rs_pct"].rank(ascending=False,method="min")
@@ -324,7 +336,7 @@ def screen_now():
     ne=df[df["netier"].notna()].sort_values(["netier","fund_rank_key"],ascending=[True,False]).copy()
     ne["신규진입"]=ne["netier"].astype(int).map(lambda t:str(t)+"위내진입")
     ne=ne[["신규진입","CODE","NAME","섹터","유형","주의","MC0_B","RANK0","rank_up","rev_streak","fund_z","margin_std","margin_pos","margin_dd","vol_ann"]]
-    KOR={"trackA_rank":"순위","trackB_rank":"순위","leader_rank":"순위","CODE":"티커","NAME":"종목명","MC0_B":"시총(십억$)","RANK0":"시총순위","RANK_1y":"1년전순위","rev_yoy":"매출증가율%","rev_streak":"매출연속성장(분기)","recent_consist":"최근꾸준%","rev_accel":"매출가속도","ttm_g":"연간매출성장%","margin_trend":"영업마진추세%p","margin_std":"마진변동성%p","margin_pos":"마진위치%","margin_dd":"예전 이익하락폭%p","p_op":"시총/영업이익(배)","margin_tcorr":"마진추세상관","pos_ratio":"성장지속%","fund_z":"펀더멘털점수","vol_ann":"주가변동성%","mdd_1y":"최대낙폭%","rank_up":"순위상승폭","hybrid":"종합점수","rs_pct":"상대강도(0~100)","near_high":"52주고점대비%","amt20_m":"일거래대금(백만$)","amt_grow":"거래대금증가%","sec_rank":"섹터내순위","lead_score":"주도주점수"}
+    KOR={"trackA_rank":"순위","trackB_rank":"순위","leader_rank":"순위","CODE":"티커","NAME":"종목명","MC0_B":"시총(십억$)","RANK0":"시총순위","RANK_1y":"1년전순위","rev_yoy":"매출증가율%","rev_streak":"매출연속성장(분기)","recent_consist":"최근꾸준%","rev_accel":"매출가속도","ttm_g":"연간매출성장%","margin_trend":"영업마진추세%p","margin_std":"마진변동성%p","margin_pos":"마진위치%","margin_dd":"예전 이익하락폭%p","p_op":"시총/영업이익(배)","margin_tcorr":"마진추세상관","pos_ratio":"성장지속%","fund_z":"펀더멘털점수","vol_ann":"주가변동성%","mdd_1y":"최대낙폭%","rank_up":"순위상승폭","hybrid":"종합점수","rs_pct":"상대강도(0~100)","near_high":"52주고점대비%","amt20_m":"일거래대금(백만$)","amt_grow":"거래대금증가%","sec_rank":"섹터내순위","lead_score":"주도주점수","is_spike":"단발스파이크","탈락사유":"탈락사유"}
     cc=lead[ccol].rename(columns=KOR) if len(lead) else pd.DataFrame(columns=[KOR.get(c,c) for c in ccol])
     a=a.rename(columns=KOR); b=b.rename(columns=KOR); ne=ne.rename(columns=KOR)
     out="/data/frame/leader_watchlist_latest.xlsx"
@@ -333,10 +345,15 @@ def screen_now():
         ne.to_excel(w,sheet_name="신규진입",index=False)
         a.to_excel(w,sheet_name="펀더멘털가속",index=False)
         b.to_excel(w,sheet_name="순위상승",index=False)
-        pd.DataFrame({"항목":["기준일","유니버스","시트 3개(주도주/펀더멘털가속/순위상승)","주도주 시트 기준","상대강도(0~100)","52주고점대비%","일거래대금","섹터내순위","마진위치%","주의","예전 이익하락폭%p","시총/영업이익","변동성/MDD","백테스트 성적(정직)","한계"],
+        # 전 종목 게이트 진단: 시총 순. 주도주에 없는 종목이 어느 조건에서 걸렸는지 여기서 본다.
+        gcol=["CODE","NAME","섹터","유형","MC0_B","RANK0","rs_pct","near_high","amt20_m","is_spike","p_op","탈락사유"]
+        gd=df.sort_values("MC0_B",ascending=False)[[c for c in gcol if c in df.columns]].rename(columns=KOR)
+        gd.to_excel(w,sheet_name="게이트진단",index=False)
+        pd.DataFrame({"항목":["기준일","유니버스","시트 3개(주도주/펀더멘털가속/순위상승)","주도주 시트 기준","게이트진단 시트","상대강도(0~100)","52주고점대비%","일거래대금","섹터내순위","마진위치%","주의","예전 이익하락폭%p","시총/영업이익","변동성/MDD","백테스트 성적(정직)","한계"],
             "값":[today,f"{len(df)}종(지금 살아있는 종목만)",
                  "주도주=지금 시장을 끌고 가는 큰 종목 / 펀더멘털가속=실적이 빨리 크는 종목(작은 것 포함) / 순위상승=시총순위가 뛴 종목. 목적이 달라서 따로 본다. 두 시트에 같이 나오면 신호가 겹친 것",
                  f"시총 {LEAD_MC_MIN/1e9:.0f}십억$ 이상 AND 일거래대금 {LEAD_AMT_MIN/1e6:.0f}백만$ 이상 AND 상대강도 상위 {100-LEAD_RS_MIN:.0f}% AND 52주고점의 {LEAD_HIGH_MIN}% 이상 AND TTM 영업이익 흑자 — 다섯 다 통과한 종목만. 배수(시총/영업이익) 상한은 두지 않음: 상한을 걸면 이익 정점의 경기민감주만 싸 보여 남는다",
+                 "유니버스 전 종목을 시총 순으로 나열하고 주도주 게이트 여섯 조건 중 어디서 걸렸는지 '탈락사유'에 적음. '통과'면 주도주 시트에 있는 종목. 지표 계산이 안 되는 종목(NaN)은 해당 조건 탈락으로 처리",
                  "다른 종목들과 비교해 주가가 얼마나 셌는지(100=가장 셈). 12개월40%+6개월30%+3개월30% 배합. 지수 데이터가 없어 '유니버스 안에서의 순위'로 계산",
                  "지금 주가가 1년 최고가의 몇 %인지. 100에 가까우면 신고가 근처",
                  "최근 20일 하루 평균 거래된 금액. 기관이 사고팔 수 있는 크기인지 보는 값",
