@@ -14,6 +14,7 @@
   python3 sector_dashboard.py --out /tmp/x.xlsx
 
 생성 시트: 섹터현황 / 월별_시총추이 / 월별_거래대금추이 / [투자자순매수] / 종목상세
+산출 파일: /data/frame/sector_dashboard_latest.xlsx 한 벌 (dated 사본은 2026-09-28 중단)
 """
 import os
 import argparse, ast, os
@@ -246,7 +247,8 @@ def main():
     amt_trend = pd.DataFrame(monthly_amt).T.reindex(order)
     stocks = pd.DataFrame(stock_rows).sort_values(["섹터", "시총_조"], ascending=[True, False])
 
-    out = args.out or f"/data/frame/sector_dashboard_{date.today():%Y%m%d}.xlsx"
+    # 2026-09-28: dated 파일(sector_dashboard_YYYYMMDD.xlsx)은 더 안 만든다. 매주 1개씩 쌓이기만 했다.
+    out = args.out or "/data/frame/sector_dashboard_latest.xlsx"
     inv_cols = [c for c in ("외국인순매수_조", "기관순매수_조", "개인순매수_조", "연기금순매수_조", "금융투자순매수_조")
                 if c in summary.columns]
     with pd.ExcelWriter(out, engine="openpyxl") as xw:
@@ -293,11 +295,6 @@ def main():
     cols_show = ["섹터", "구성종목수", "섹터시총_조", "시총비중%", "시총가중수익률%", "변동성%", "거래대금비중%", "PER중앙값", "PBR중앙값"]
     print(summary[[c for c in cols_show if c in summary.columns]].to_string(index=False))
     print(f"\nExcel 저장: {out}")
-    if args.out is None:
-        import shutil
-        latest = "/data/frame/sector_dashboard_latest.xlsx"
-        shutil.copy(out, latest)
-        print(f"최신본 복사: {latest}")
 
 
 if __name__ == "__main__":

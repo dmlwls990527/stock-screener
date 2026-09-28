@@ -1676,23 +1676,21 @@ def run_factor_analysis(market="us", years=YEARS, top_n=TOP_N):
     if trend_df is not None:
         print(f"  시총 Top{len(trend_df)} 추이: 5년전 {ref_dates.get('5년')} ~ 현재 {ref_dates.get('현재')}")
 
-    # Excel 저장
-    today      = date.today().strftime("%Y%m%d")
-    out_path   = f"/data/frame/factor_result_{market}_{today}.xlsx"
-    latest     = f"/data/frame/factor_result_{market}_latest.xlsx"
+    # Excel 저장 — latest 한 벌만 쓴다.
+    # 2026-09-28 까지는 같은 내용을 dated 사본으로 한 번 더 저장했는데, 다음 주 실행 때
+    # 어차피 지워지는 파일이라 이력 가치가 없었고 "엑셀이 너무 많이 생긴다"는 지적만 남겼다.
+    out_path = f"/data/frame/factor_result_{market}_latest.xlsx"
     save_excel(result, f1_detail, f2_detail, market, years, out_path, trend_df, ref_dates, name_map)
-    save_excel(result, f1_detail, f2_detail, market, years, latest, trend_df, ref_dates, name_map)
-    cleanup_old_results(market, out_path, latest)
+    cleanup_old_results(market, out_path)
 
     return result, out_path
 
 
-def cleanup_old_results(market, keep_dated_path, keep_latest_path):
-    """이번에 새로 만든 dated/latest 파일만 남기고, 같은 market의 이전 factor_result_*.xlsx는 삭제."""
+def cleanup_old_results(market, keep_path):
+    """latest 만 남기고, 같은 market 의 다른 factor_result_*.xlsx(예전 dated 사본)는 삭제."""
     pattern = f"/data/frame/factor_result_{market}_*.xlsx"
-    keep = {keep_dated_path, keep_latest_path}
     for f in glob.glob(pattern):
-        if f not in keep:
+        if f != keep_path:
             os.remove(f)
             print(f"  이전 결과 삭제: {f}")
 
