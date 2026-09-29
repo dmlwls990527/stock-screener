@@ -453,5 +453,42 @@ class TestGrid(unittest.TestCase):
         self.assertAlmostEqual(r["2022"], -10.0)
 
 
+
+
+# ── 손절 방식: 추적(최고가 대비) vs 고정(매입가 대비) ─────────────────────────
+class TestStopTypes(unittest.TestCase):
+    def test_fixed_stop_uses_entry_not_high_water(self):
+        es = strategy.sync_exit_state({}, {"A": {"qty": 1.0, "avg_price": 100.0}})
+        strategy.mark_high_water(es, {"A": 150.0})                       # 최고가 150
+        # 추적 −20% 면 120 이하에서 걸리지만, 고정 −20% 는 매입가 100 기준 80 이하
+        self.assertEqual(strategy.check_trailing(es, {"A": 110.0}, 20, "t", "fixed"), [])
+        self.assertEqual(strategy.check_trailing(es, {"A": 80.0}, 20, "t", "fixed"), ["A"])
+        self.assertTrue(es["A"]["pending_exit"]["reason"].startswith(strategy.REASON_FIXED))
+        es2 = strategy.sync_exit_state({}, {"A": {"qty": 1.0, "avg_price": 100.0}})
+        strategy.mark_high_water(es2, {"A": 150.0})
+        self.assertEqual(strategy.check_trailing(es2, {"A": 110.0}, 20, "t", "trailing"), ["A"])
+
+    def test_entry_follows_topup_avg(self):
+        es = strategy.sync_exit_state({}, {"A": {"qty": 1.0, "avg_price": 100.0}})
+        strategy.sync_exit_state(es, {"A": {"qty": 2.0, "avg_price": 90.0}})
+        self.assertEqual(es["A"]["entry"], 90.0)
+        self.assertAlmostEqual(strategy.stop_price(es["A"], 10, "fixed"), 81.0)
+
+    def test_stop_type_validation_and_label(self):
+        cfg = v2cfg()
+        cfg["exit"]["stop_type"] = "fixed"
+        self.assertIn("매입가 대비", strategy.rule_label(cfg))
+        cfg["exit"]["stop_type"] = "x"
+        with self.assertRaises(ValueError):
+            strategy.exit_cfg(cfg)
+
+    def test_stops_variant_set(self):
+        v = replay.variant_configs(v2cfg(), "stops")
+        self.assertEqual(list(v), ["R3_nostop", "T10", "T15", "T20", "T25", "T30", "F10", "F20", "F30"])
+        self.assertEqual(v["F20"]["exit"]["stop_type"], "fixed")
+        self.assertEqual(v["T25"]["exit"]["trailing_stop_pct"], 25)
+        self.assertEqual(strategy.every_weeks(v["T10"]), 3)
+
+
 if __name__ == "__main__":
     unittest.main()

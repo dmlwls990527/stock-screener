@@ -32,10 +32,11 @@ from rules import (OrderPlan, REASON_NO_QUOTE, REASON_PENDING, _section, _float,
                    cash_buffer_pct, pending_buy_symbols)
 
 DEFAULT_REBALANCE = {"mode": "B", "topup_threshold_pct": 30, "every_weeks": 1}
-DEFAULT_EXIT = {"enabled": True, "trailing_stop_pct": 15, "gate_absent_weeks": 2}
+DEFAULT_EXIT = {"enabled": True, "trailing_stop_pct": 15, "gate_absent_weeks": 2, "stop_type": "trailing"}
 DEFAULT_SIZING = {"max_positions": 50, "min_order_usd": 20}
 
-REASON_TRAIL = "추적손절"
+REASON_TRAIL = "추적손절"          # 보유 후 최고가 대비
+REASON_FIXED = "손절"              # 매입가(평균단가) 대비
 REASON_GATE = "게이트탈락"
 REASON_TRIM = "비중초과"
 REASON_SOLD_NOW = "이번 실행에서 매도됨 → 재매수 안 함"
@@ -56,9 +57,13 @@ def client_id(prefix, sym):
 
 def exit_cfg(cfg):
     ex = _section(cfg, "exit", DEFAULT_EXIT)
+    st = str(ex.get("stop_type", "trailing")).lower()
+    if st not in ("trailing", "fixed"):
+        raise ValueError(f"설정 exit.stop_type 은 trailing(최고가 대비) 또는 fixed(매입가 대비): {st!r}")
     return {"enabled": bool(ex.get("enabled", True)),
             "trailing_stop_pct": _float(ex, "exit", "trailing_stop_pct"),
-            "gate_absent_weeks": max(1, _int(ex, "exit", "gate_absent_weeks"))}
+            "gate_absent_weeks": max(1, _int(ex, "exit", "gate_absent_weeks")),
+            "stop_type": st}
 
 
 def every_weeks(cfg):
@@ -144,6 +149,9 @@ def sync_exit_state(es, holdings):
         st = es.setdefault(sym, {"high_water": None, "absent_weeks": 0, "pending_exit": None})
         st.setdefault("absent_weeks", 0)
         st.setdefault("pending_exit", None)
+        ap0 = float(p.get("avg_price") or 0.0)
+        if ap0 > 0:
+            st["entry"] = ap0            # 고정 손절 기준 (추가매수하면 평균단가를 따라감)
         if not st.get("high_water"):
             ap = float(p.get("avg_price") or 0.0)
             st["high_water"] = ap if ap > 0 else None
@@ -159,12 +167,15 @@ def mark_high_water(es, quotes):
             st["high_water"] = max(float(hw), float(q))
 
 
-def stop_price(st, pct):
-    hw = st.get("high_water")
-    return float(hw) * (1 - pct / 100.0) if hw else None
+def stop_price(st, pct, stop_type="trailing"):
+    """손절가. trailing = 최고가×(1−pct%), fixed = 매입가(평균단가)×(1−pct%). pct 0 이하/100 이상이면 None."""
+    if not pct or pct <= 0 or pct >= 100:
+        return None
+    base = st.get("entry") if stop_type == "fixed" else st.get("high_water")
+    return float(base) * (1 - pct / 100.0) if base else None
 
 
-def check_trailing(es, quotes, pct, ts):
+def check_trailing(es, quotes, pct, ts, stop_type="trailing"):
     """시세 ≤ 최고가×(1−pct%) 이면 pending_exit 표시. 새로 걸린 종목 리스트를 돌려준다.
     pct 가 0 이하(또는 100 이상)면 추적손절 끔."""
     hits = []
@@ -174,12 +185,15 @@ def check_trailing(es, quotes, pct, ts):
         if st.get("pending_exit"):
             continue
         q = (quotes or {}).get(sym)
-        sp = stop_price(st, pct)
+        sp = stop_price(st, pct, stop_type)
         if not q or sp is None:
             continue
         if q <= sp:
-            st["pending_exit"] = {"reason": f"{REASON_TRAIL} −{pct:g}% (최고 {st['high_water']:.2f} → "
-                                            f"{q:.2f}, 손절가 {sp:.2f})", "ts": ts}
+            if stop_type == "fixed":
+                why = f"{REASON_FIXED} −{pct:g}% (매입가 {st['entry']:.2f} → {q:.2f}, 손절가 {sp:.2f})"
+            else:
+                why = f"{REASON_TRAIL} −{pct:g}% (최고 {st['high_water']:.2f} → {q:.2f}, 손절가 {sp:.2f})"
+            st["pending_exit"] = {"reason": why, "ts": ts}
             hits.append(sym)
     return hits
 
@@ -368,7 +382,8 @@ def rule_label(cfg):
     if not ex["enabled"]:
         sell = "매도규칙 꺼짐"
     else:
-        stop = (f"추적손절 −{ex['trailing_stop_pct']:g}%" if 0 < ex["trailing_stop_pct"] < 100 else "추적손절 없음")
+        kind = "손절(매입가 대비)" if ex["stop_type"] == "fixed" else "추적손절"
+        stop = (f"{kind} −{ex['trailing_stop_pct']:g}%" if 0 < ex["trailing_stop_pct"] < 100 else "손절 없음")
         gate = ("리밸런스 때 목록 밖이면 매도" if ex["gate_absent_weeks"] <= 1
                 else f"게이트탈락 {ex['gate_absent_weeks']}회")
         sell = f"{stop} · {gate}"

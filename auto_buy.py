@@ -651,9 +651,9 @@ def _print_summary(broker, cfg=None):
                  o.get("quantity"), o.get("price"), o.get("expiresAt"), o["orderId"])
     es = broker_meta_get(broker, "exit_state") or {}
     if es:
-        pct = strategy.exit_cfg(cfg)["trailing_stop_pct"] if cfg and is_v2(cfg) else 15
+        exc = strategy.exit_cfg(cfg) if cfg and is_v2(cfg) else {"trailing_stop_pct": 15, "stop_type": "trailing"}
         for sym, st in sorted(es.items()):
-            sp = strategy.stop_price(st, pct)
+            sp = strategy.stop_price(st, exc["trailing_stop_pct"], exc["stop_type"])
             log.info("  매도조건 %-6s 최고가 %s 손절가 %s 탈락주수 %s %s", sym,
                      f"{st['high_water']:.2f}" if st.get('high_water') else '-',
                      f"{sp:.2f}" if sp else '-', st.get('absent_weeks', 0),
@@ -920,7 +920,7 @@ def watch_exits(cfg, broker, where, listed=None, asof=None, quotes=None):
         quotes = fetch_quotes(broker, list(holdings))
     ts = fmt_ts(_broker_now(broker))
     strategy.mark_high_water(es, quotes)
-    hits = strategy.check_trailing(es, quotes, ex["trailing_stop_pct"], ts)
+    hits = strategy.check_trailing(es, quotes, ex["trailing_stop_pct"], ts, ex["stop_type"])
     if listed is not None and asof and broker_meta_get(broker, "gate_checked_asof") != asof:
         hits += strategy.update_gate_absence(es, listed, ex["gate_absent_weeks"], ts)
         broker_meta_set(broker, gate_checked_asof=asof)
@@ -1150,7 +1150,7 @@ def add_v2_columns(cfg, pos_df, broker):
     import pandas as pd
     ctx = load_context(cfg)
     es = es_load(broker)
-    pct = strategy.exit_cfg(cfg)["trailing_stop_pct"]
+    exc = strategy.exit_cfg(cfg)
     eq = broker.summary()["equity_usd"] or 0.0
     w = strategy.target_weights(ctx["cands"], strategy.weighting(cfg)) if ctx else {}
     cols = ["목표비중%", "보유비중%", "최고가", "손절가", "탈락주수", "매도대기"]
@@ -1158,7 +1158,7 @@ def add_v2_columns(cfg, pos_df, broker):
     for _, r in pos_df.iterrows():
         sym = str(r["티커"]).upper()
         st = es.get(sym, {})
-        sp = strategy.stop_price(st, pct)
+        sp = strategy.stop_price(st, exc["trailing_stop_pct"], exc["stop_type"])
         rows.append([round(w[sym] * 100, 2) if sym in w else "목록 밖",
                      round(float(r["평가금액"]) / eq * 100, 2) if eq else None,
                      round(st["high_water"], 4) if st.get("high_water") else None,
@@ -1248,7 +1248,7 @@ def build_parser():
     rr.add_argument("--refresh", action="store_true", help="스크리닝 캐시 무시하고 다시 계산")
     rr.add_argument("--out", default=None, help="결과 엑셀 경로 (기본 paper_replay_latest.xlsx)")
     rr.add_argument("--compare", action="store_true", help="여러 설정을 같은 스크리닝으로 비교")
-    rr.add_argument("--compare-set", default="rebal", choices=["rebal", "rules", "grid"],
+    rr.add_argument("--compare-set", default="rebal", choices=["rebal", "rules", "grid", "stops"],
                     help="rebal = 리밸런스 주기·종목수·손절 비교 / rules = v1·v2-A/B/C")
     rs = sp.add_parser("reset", parents=[common], help="페이퍼 상태 초기화")
     rs.add_argument("--yes", action="store_true")

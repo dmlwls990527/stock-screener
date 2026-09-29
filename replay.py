@@ -978,7 +978,7 @@ def simulate_v2(dates, trading_days, screen_fn, panel, cfg, state_path, end=None
                 strategy.sync_exit_state(es, h)
                 q = quotes_at(D, "CLOSE", h)
                 strategy.mark_high_water(es, q)
-                strategy.check_trailing(es, q, pct, D)
+                strategy.check_trailing(es, q, pct, D, ex["stop_type"])
 
     for i, rd in enumerate(dates):
         asof = pick_asof(rd, trading_days)
@@ -1133,11 +1133,11 @@ _V1 = {"sizing": {"method": "equal", "per_stock_usd": 1000, "weekly_cap_usd": 30
        "source": {"top_n": 5, "exclude_if_주의": True}, "exit": {"enabled": False}}
 
 
-def _R(every, top_n=50, stop=0, weighting="score"):
+def _R(every, top_n=50, stop=0, weighting="score", stop_type="trailing"):
     """정기 리밸런스: every 주마다 목록·비중 재계산, 목록 밖은 매도(탈락 1회), 비중 ±30% 벗어나면 양방향 조정."""
     return {"sizing": {"method": "score_weight", "weighting": weighting}, "source": {"top_n": top_n},
             "rebalance": {"mode": "C", "every_weeks": every},
-            "exit": {"enabled": True, "gate_absent_weeks": 1, "trailing_stop_pct": stop}}
+            "exit": {"enabled": True, "gate_absent_weeks": 1, "trailing_stop_pct": stop, "stop_type": stop_type}}
 
 
 # 세트 이름 → ([(키, 설명, 설정 덮어쓰기)], 요약 시트에 쓸 대표 키)
@@ -1167,6 +1167,11 @@ VARIANT_SETS = {
               ("R4_20", "4주 · 상위20 · 점수가중", _R(4, top_n=20)),
               ("R3_50_eq", "3주 · 50종 · 균등가중", _R(3, weighting="equal"))],
              "R3_50"),
+    # 손절 비율 비교: 3주 · 50종 · 점수가중 고정, 손절만 바꾼다
+    "stops": ([("R3_nostop", "3주·50종 · 손절 없음", _R(3))]
+              + [(f"T{p}", f"3주·50종 · 추적손절 −{p}% (최고가 대비)", _R(3, stop=p)) for p in (10, 15, 20, 25, 30)]
+              + [(f"F{p}", f"3주·50종 · 손절 −{p}% (매입가 대비)", _R(3, stop=p, stop_type="fixed")) for p in (10, 20, 30)],
+              "R3_nostop"),
 }
 
 
@@ -1244,7 +1249,7 @@ def compare_row(key, label, res):
         "최대낙폭%": round(float(s["max_drawdown_pct"]), 2), "최대낙폭 구간": worst,
         "연환산변동성%": round(vol, 2),
         "매수건수": int((tr["매매"] == "BUY").sum()), "매도건수": int(len(sells)),
-        "추적손절 매도": int(sells.str.startswith(strategy.REASON_TRAIL).sum()),
+        "손절 매도": int((sells.str.startswith(strategy.REASON_TRAIL) | sells.str.startswith(strategy.REASON_FIXED)).sum()),
         "게이트탈락 매도": int((sells.str.startswith(strategy.REASON_GATE) | sells.str.startswith("목록 이탈")).sum()),
         "비중초과 매도": int(sells.str.startswith(strategy.REASON_TRIM).sum()),
         "평균보유종목수": round(sum(r["보유종목수"] for r in rs) / len(rs), 1) if rs else 0,
