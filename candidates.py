@@ -16,7 +16,8 @@ candidates.py — 자동매수 후보 목록: 항상 상위 N종목 (2026-09-29 
 """
 import pandas as pd
 
-DEFAULTS = {"mode": "leaders", "n": 10, "mc_top": 0.97, "amt_top": 0.66, "rs_min": 80, "high_min": 85}
+DEFAULTS = {"mode": "leaders", "n": 10, "mc_top": 0.97, "amt_top": 0.66, "rs_min": 80, "high_min": 85,
+            "amt_signal": "20d"}
 QUALITY_FAIL = "단발스파이크|영업적자/무재무"
 OUT_COLS = ["순위", "티커", "종목명", "섹터", "유형", "주의", "구분", "주도주점수", "우선점수",
             "시총(십억$)", "일거래대금(백만$)", "상대강도(0~100)", "52주고점대비%"]
@@ -57,12 +58,13 @@ def top_fill(uni, n=10, mc_top=0.97, amt_top=0.66, rs_min=80, high_min=85, **_):
 def watchlist_for(scr, cfg):
     """replay: 스크리닝 결과 → 매매에 쓸 목록. candidates.mode=top_fill 이면 상위 N 채움 목록, 아니면 주도주 시트."""
     p = params(cfg)
+    uni = rescore(scr.get("universe"), scr.get("asof"), p.get("amt_signal", "20d"))
     if p["mode"] == "top_fill":
-        return top_fill(scr.get("universe"), **p)
+        return top_fill(uni, **p)
     if p["mode"] == "growth_leader":
-        return growth_leader(scr.get("universe"), scr.get("asof"), **p)
+        return growth_leader(uni, scr.get("asof"), **p)
     if p["mode"] == "rank_riser":
-        return rank_riser(scr.get("universe"), scr.get("asof"), **p)
+        return rank_riser(uni, scr.get("asof"), **p)
     return scr.get("watchlist")
 
 
@@ -128,3 +130,40 @@ def rank_riser(uni, asof, n=10, mc_top=0.97, amt_top=0.66, **_):
     d["_sc"] = sc
     pick = d[base & d["riser"]].sort_values("rank_ratio2", ascending=False).assign(구분="순위상승")
     return _finish(pick, n)
+
+
+# ── 주도주점수의 거래대금 항목 창 바꾸기 (2026-09-29) ─────────────────────────
+# leader_screener: lead_score = 백분위배합(rs_pct 0.4, fund_z 0.3, amt_grow 0.3) + 섹터 1·2위 가점 0.10
+#   amt_grow = 최근 20일 평균 거래대금 ÷ 그 전 60일 평균 − 1  (너무 짧다는 의견 → 6개월 / 1년 / 제거 비교)
+AMT_SIGNALS = {"20d": None, "6m": "amt_g6", "12m": "amt_g12", "none": None}
+
+
+def _blend(d, pairs):
+    acc = wsum = None
+    for c, w in pairs:
+        pc = pd.to_numeric(d[c], errors="coerce").rank(pct=True) * 100
+        m = pc.notna()
+        acc = pc.fillna(0) * w if acc is None else acc + pc.fillna(0) * w
+        wsum = m * w if wsum is None else wsum + m * w
+    return acc / wsum.replace(0, float("nan"))
+
+
+def rescore(uni, asof, amt_signal):
+    """amt_signal 에 맞춰 lead_score 를 다시 계산한 사본. 섹터 가점은 원래 점수에서 역산해 그대로 둔다."""
+    if amt_signal in (None, "20d") or uni is None or len(uni) == 0:
+        return uni
+    if amt_signal not in AMT_SIGNALS:
+        raise ValueError(f"candidates.amt_signal 은 {list(AMT_SIGNALS)} 중 하나: {amt_signal!r}")
+    d = uni.copy()
+    orig = _blend(d, [("rs_pct", 0.4), ("fund_z", 0.3), ("amt_grow", 0.3)]) / 100
+    bonus = (pd.to_numeric(d["lead_score"], errors="coerce") - orig).round(1).clip(lower=0)   # 0 또는 0.1
+    if amt_signal == "none":
+        new = _blend(d, [("rs_pct", 0.4), ("fund_z", 0.3)]) / 100
+    else:
+        import growth_factors
+        col = AMT_SIGNALS[amt_signal]
+        f = growth_factors.features(asof)[[col]]
+        d = d.merge(f, left_on="CODE", right_index=True, how="left")
+        new = _blend(d, [("rs_pct", 0.4), ("fund_z", 0.3), (col, 0.3)]) / 100
+    d["lead_score"] = (new + bonus.fillna(0)).round(3)
+    return d

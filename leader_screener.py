@@ -196,6 +196,14 @@ LEAD_AMT_MIN  = 300e6   # 최소 일평균 거래대금 $300M — 기관 진입 
 LEAD_RS_MIN   = 80      # 상대강도 상위 20%
 LEAD_HIGH_MIN = 85      # 52주 고점의 85% 이상 (고점 근처에서 버티는 중)
 
+def _grow(am, n):
+    """최근 n일 평균 ÷ 그 전 n일 평균 − 1 (%). 데이터 부족·0·NaN 이면 NaN."""
+    if len(am) < 2 * n:
+        return np.nan
+    a, b = np.nanmean(am[-n:]), np.nanmean(am[-2 * n:-n])
+    return round((a / b - 1) * 100) if (np.isfinite(a) and np.isfinite(b) and b > 0) else np.nan
+
+
 def price_metrics(asof):
     """유니버스 전체의 가격·유동성 지표. 상대강도(RS) 백분위 계산에 전 종목이 필요하다."""
     d=dq(f"""SELECT CODE, TO_CHAR(date_,'YYYY-MM-DD') AS D, CLOSE AS C, HIGH AS H, AMOUNT AS A
@@ -220,8 +228,10 @@ def price_metrics(asof):
             ret_12m=cum(252), ret_6m=cum(126), ret_3m=cum(63),
             near_high=round(cl[-1]/hh*100,1) if hh and hh>0 else np.nan,
             amt20=float(np.nanmean(am[-20:])) if len(am)>=20 else np.nan,
-            amt_grow=round((np.nanmean(am[-20:])/np.nanmean(am[-80:-20])-1)*100) \
-                     if (len(am)>=80 and np.nanmean(am[-80:-20])>0) else np.nan))
+            # 거래대금 증가 = 최근 6개월(126거래일) 평균 ÷ 그 전 6개월 평균 − 1  (2026-09-29, 20일÷60일에서 변경)
+            #   설계 구간(2016~2022, 시점별 S&P 500, 상위10·3주) 연평균: 20일 −1.6% / 6개월 +3.9% / 1년 +0.7% /
+            #   항목 제거 +2.3% (SPY 11.6%). 20일은 빼는 것보다도 나빴다. NaN 이면 round 가 터지던 것도 막음.
+            amt_grow=_grow(am, 126)))
     p=pd.DataFrame(rows)
     if p.empty: return p
     # RS = 기간별 수익률의 '유니버스 내 백분위'를 가중 평균 (오닐식 12/6/3개월 배합).
@@ -336,7 +346,7 @@ def screen_now():
     ne=df[df["netier"].notna()].sort_values(["netier","fund_rank_key"],ascending=[True,False]).copy()
     ne["신규진입"]=ne["netier"].astype(int).map(lambda t:str(t)+"위내진입")
     ne=ne[["신규진입","CODE","NAME","섹터","유형","주의","MC0_B","RANK0","rank_up","rev_streak","fund_z","margin_std","margin_pos","margin_dd","vol_ann"]]
-    KOR={"trackA_rank":"순위","trackB_rank":"순위","leader_rank":"순위","CODE":"티커","NAME":"종목명","MC0_B":"시총(십억$)","RANK0":"시총순위","RANK_1y":"1년전순위","rev_yoy":"매출증가율%","rev_streak":"매출연속성장(분기)","recent_consist":"최근꾸준%","rev_accel":"매출가속도","ttm_g":"연간매출성장%","margin_trend":"영업마진추세%p","margin_std":"마진변동성%p","margin_pos":"마진위치%","margin_dd":"예전 이익하락폭%p","p_op":"시총/영업이익(배)","margin_tcorr":"마진추세상관","pos_ratio":"성장지속%","fund_z":"펀더멘털점수","vol_ann":"주가변동성%","mdd_1y":"최대낙폭%","rank_up":"순위상승폭","hybrid":"종합점수","rs_pct":"상대강도(0~100)","near_high":"52주고점대비%","amt20_m":"일거래대금(백만$)","amt_grow":"거래대금증가%","sec_rank":"섹터내순위","lead_score":"주도주점수","is_spike":"단발스파이크","탈락사유":"탈락사유"}
+    KOR={"trackA_rank":"순위","trackB_rank":"순위","leader_rank":"순위","CODE":"티커","NAME":"종목명","MC0_B":"시총(십억$)","RANK0":"시총순위","RANK_1y":"1년전순위","rev_yoy":"매출증가율%","rev_streak":"매출연속성장(분기)","recent_consist":"최근꾸준%","rev_accel":"매출가속도","ttm_g":"연간매출성장%","margin_trend":"영업마진추세%p","margin_std":"마진변동성%p","margin_pos":"마진위치%","margin_dd":"예전 이익하락폭%p","p_op":"시총/영업이익(배)","margin_tcorr":"마진추세상관","pos_ratio":"성장지속%","fund_z":"펀더멘털점수","vol_ann":"주가변동성%","mdd_1y":"최대낙폭%","rank_up":"순위상승폭","hybrid":"종합점수","rs_pct":"상대강도(0~100)","near_high":"52주고점대비%","amt20_m":"일거래대금(백만$)","amt_grow":"거래대금증가%(6개월)","sec_rank":"섹터내순위","lead_score":"주도주점수","is_spike":"단발스파이크","탈락사유":"탈락사유"}
     cc=lead[ccol].rename(columns=KOR) if len(lead) else pd.DataFrame(columns=[KOR.get(c,c) for c in ccol])
     a=a.rename(columns=KOR); b=b.rename(columns=KOR); ne=ne.rename(columns=KOR)
     out="/data/frame/leader_watchlist_latest.xlsx"

@@ -58,6 +58,7 @@ def main():
     riser.insert(0, "순위", range(1, len(riser) + 1))
     sheets["Top20진입전후보"] = riser
     if desc is not None:
+        desc = desc[~desc["항목"].astype(str).isin(["성장·순위 지표(참고)", "Top20진입전후보"])]
         desc = pd.concat([desc, pd.DataFrame([
             ("성장·순위 지표(참고)", "거래대금3년연속↑ = 연 평균 일 거래대금이 3년 연속 증가, 시총3년연속↑ = 시총 3년 연속 증가, "
                                "순위상승배수 = 2년 전 시총순위 ÷ 지금 순위. 과거 시총 = 종가 × 지금 주식 수 (근사)"),

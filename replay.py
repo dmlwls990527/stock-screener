@@ -1270,6 +1270,12 @@ VARIANT_SETS = {
                 ("G2_riser", "Top20 진입 전 후보: 시총순위 21~100·2년 연속 개선·1.5배 (최대10·순위가중·3주)",
                  {**_F(), "candidates": {"mode": "rank_riser", "n": 10}})],
                "G1_steady"),
+    # 주도주점수의 거래대금 항목 창 비교 (2026-09-29): 20일(현재) / 6개월 / 1년 / 제거
+    "amt": ([("A20d", "거래대금 20일÷60일 (현재)", _F()),
+             ("A6m", "거래대금 6개월÷직전 6개월", {**_F(), "candidates": {"mode": "top_fill", "n": 10, "amt_signal": "6m"}}),
+             ("A12m", "거래대금 1년÷직전 1년", {**_F(), "candidates": {"mode": "top_fill", "n": 10, "amt_signal": "12m"}}),
+             ("Anone", "거래대금 항목 제거 (상대강도·재무만)", {**_F(), "candidates": {"mode": "top_fill", "n": 10, "amt_signal": "none"}})],
+            "A6m"),
     "stops": ([("R3_nostop", "3주·50종 · 손절 없음", _R(3))]
               + [(f"T{p}", f"3주·50종 · 추적손절 −{p}% (최고가 대비)", _R(3, stop=p)) for p in (10, 15, 20, 25, 30)]
               + [(f"F{p}", f"3주·50종 · 손절 −{p}% (매입가 대비)", _R(3, stop=p, stop_type="fixed")) for p in (10, 20, 30)],

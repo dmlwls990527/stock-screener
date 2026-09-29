@@ -63,6 +63,7 @@
     "mc_top": 0.97,
     "amt_top": 0.66,
     "rs_min": 80,
-    "high_min": 85
+    "high_min": 85,
+    "amt_signal": "6m"
   }
 }

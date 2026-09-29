@@ -32,7 +32,12 @@ def main():
     asof = replay.db_latest_date()
     members = replay.sp500_members(asof)
     scr = replay.screen_asof(asof, use_cache=False, universe="sp500_pit")
-    out = candidates.top_fill(scr["universe"], **p)
+    # 거래대금 항목 창(candidates.amt_signal, 기본 6개월)에 맞춰 점수를 다시 매긴다 — 백테스트와 같은 경로.
+    import growth_factors as gf
+    gf.load_panels(start=(pd.Timestamp(asof) - pd.DateOffset(years=4, months=2)).strftime("%Y-%m-%d"),
+                   refresh=True, persist=False)
+    uni = candidates.rescore(scr["universe"], asof, p.get("amt_signal", "20d"))
+    out = candidates.top_fill(uni, **p)
     n = len(out)
     tot = n * (n + 1) / 2 if n else 1
     out.insert(out.columns.get_loc("구분") + 1, "목표비중%", [round((n - i) / tot * 100, 2) for i in range(n)])
@@ -44,6 +49,7 @@ def main():
         ("모멘텀 조건", f"상대강도 ≥ {p['rs_min']} AND 52주 고점 대비 ≥ {p['high_min']}%"),
         ("품질 조건", "영업적자/재무없음·단발 스파이크 제외 (채울 때도)"),
         ("비중", "순위가중: 1위 N, 2위 N−1 … N위 1"),
+        ("점수", f"주도주점수 = 상대강도 40% + 재무 30% + 거래대금 증가 30% (거래대금 창: {p.get('amt_signal')})"),
         ("통과 / 채움", f"{int((out['구분'] == '통과').sum())} / {int((out['구분'] == '채움').sum())}"),
     ], columns=["항목", "값"])
     with pd.ExcelWriter(OUT, engine="openpyxl") as xw:

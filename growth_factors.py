@@ -79,6 +79,15 @@ def features(T, P=None):
         m = sl.mean(skipna=True)
         m[sl.notna().sum() < MIN_DAYS] = np.nan
         ys.append(m)
+    # 6개월 창 (거래대금 증가 신호용): (T−6개월, T], (T−12개월, T−6개월]
+    h = []
+    for k in range(2):
+        lo = (pd.Timestamp(T) - pd.DateOffset(months=6 * (k + 1))).strftime("%Y-%m-%d")
+        hi = (pd.Timestamp(T) - pd.DateOffset(months=6 * k)).strftime("%Y-%m-%d")
+        sl = amt[(amt.index > lo) & (amt.index <= hi)]
+        m = sl.mean(skipna=True)
+        m[sl.notna().sum() < MIN_DAYS // 2] = np.nan
+        h.append(m)
     mcs = [_at(mc, _ago(T, k)) for k in range(4)]
     rks = [_at(rk, _ago(T, k)) for k in range(3)]
     f = pd.DataFrame({f"amt_y{k}": ys[k] for k in range(4)})
@@ -86,6 +95,9 @@ def features(T, P=None):
         f[f"mc_{k}"] = mcs[k]
     for k in range(3):
         f[f"rank{k}"] = rks[k]
+    f["amt_6m0"], f["amt_6m1"] = h[0], h[1]
+    f["amt_g6"] = f.amt_6m0 / f.amt_6m1 - 1          # 최근 6개월 ÷ 그 전 6개월 − 1
+    f["amt_g12"] = f.amt_y0 / f.amt_y1 - 1           # 최근 1년 ÷ 그 전 1년 − 1
     f["amt_steady"] = (f.amt_y0 > f.amt_y1) & (f.amt_y1 > f.amt_y2) & (f.amt_y2 > f.amt_y3)
     f["amt_cagr3"] = (f.amt_y0 / f.amt_y3) ** (1 / 3) - 1
     f["mc_steady"] = (f.mc_0 > f.mc_1) & (f.mc_1 > f.mc_2) & (f.mc_2 > f.mc_3)
