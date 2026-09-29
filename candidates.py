@@ -59,4 +59,72 @@ def watchlist_for(scr, cfg):
     p = params(cfg)
     if p["mode"] == "top_fill":
         return top_fill(scr.get("universe"), **p)
+    if p["mode"] == "growth_leader":
+        return growth_leader(scr.get("universe"), scr.get("asof"), **p)
+    if p["mode"] == "rank_riser":
+        return rank_riser(scr.get("universe"), scr.get("asof"), **p)
     return scr.get("watchlist")
+
+
+# ── 꾸준한 성장 / Top 20 진입 전 후보 (2026-09-29) ──────────────────────────
+GROWTH_COLS = ["3년거래대금증가율%", "3년시총증가율%", "시총순위", "1년전순위", "2년전순위", "순위상승배수"]
+
+
+def _with_growth(uni, asof):
+    import growth_factors
+    f = growth_factors.features(asof)
+    keep = ["amt_steady", "mc_steady", "amt_cagr3", "mc_cagr3", "rank0", "rank1", "rank2", "rank_ratio2", "riser"]
+    d = uni.merge(f[keep], left_on="CODE", right_index=True, how="left")
+    for c in ("amt_steady", "mc_steady", "riser"):
+        d[c] = d[c].fillna(False).astype(bool)
+    return d
+
+
+def _finish(out, n):
+    out = out.head(int(n)).reset_index(drop=True)
+    out["순위"] = range(1, len(out) + 1)
+    out["우선점수"] = [len(out) - i for i in range(len(out))]
+    out = out.rename(columns={"CODE": "티커", "NAME": "종목명", "_sc": "주도주점수", "MC0_B": "시총(십억$)",
+                              "amt20_m": "일거래대금(백만$)", "rs_pct": "상대강도(0~100)", "near_high": "52주고점대비%",
+                              "rank0": "시총순위", "rank1": "1년전순위", "rank2": "2년전순위", "rank_ratio2": "순위상승배수"})
+    out["3년거래대금증가율%"] = (pd.to_numeric(out.get("amt_cagr3"), errors="coerce") * 100).round(1)
+    out["3년시총증가율%"] = (pd.to_numeric(out.get("mc_cagr3"), errors="coerce") * 100).round(1)
+    cols = OUT_COLS + GROWTH_COLS
+    for c in cols:
+        if c not in out.columns:
+            out[c] = None
+    return out[cols]
+
+
+def _masks(d, mc_top, amt_top, rs_min, high_min):
+    num = lambda c: pd.to_numeric(d[c], errors="coerce") if c in d.columns else pd.Series(float("nan"), index=d.index)
+    mc, am, rs, hi, sc = num("MC0_B"), num("amt20_m"), num("rs_pct"), num("near_high"), num("lead_score")
+    why = d["탈락사유"].astype(str) if "탈락사유" in d.columns else pd.Series("", index=d.index)
+    quality = ~why.str.contains(QUALITY_FAIL, regex=True)
+    size_ok = (mc.rank(pct=True) >= 1 - mc_top) & (am.rank(pct=True) >= 1 - amt_top)
+    mom_ok = (rs >= rs_min) & (hi >= high_min)
+    return size_ok & quality & sc.notna(), mom_ok, sc
+
+
+def growth_leader(uni, asof, n=10, mc_top=0.97, amt_top=0.66, rs_min=80, high_min=85, **_):
+    """주도주 조건 + 3년 연속 거래대금·시총 증가. 모자라면 (크기·품질·꾸준성장) 종목을 점수 순으로 채움."""
+    if uni is None or len(uni) == 0:
+        return pd.DataFrame(columns=OUT_COLS + GROWTH_COLS)
+    d = _with_growth(uni, asof)
+    base, mom_ok, sc = _masks(d, mc_top, amt_top, rs_min, high_min)
+    base = base & d["amt_steady"] & d["mc_steady"]
+    d["_sc"] = sc
+    passed = d[base & mom_ok].sort_values("_sc", ascending=False).assign(구분="통과")
+    fill = d[base & ~mom_ok].sort_values("_sc", ascending=False).assign(구분="채움")
+    return _finish(pd.concat([passed, fill]), n)
+
+
+def rank_riser(uni, asof, n=10, mc_top=0.97, amt_top=0.66, **_):
+    """Top 20 진입 전 후보: 시총순위 21~100, 2년 연속 순위 개선, 2년 전 순위÷지금 ≥ 1.5. 상승 배수 순. 채우지 않음."""
+    if uni is None or len(uni) == 0:
+        return pd.DataFrame(columns=OUT_COLS + GROWTH_COLS)
+    d = _with_growth(uni, asof)
+    base, _mom, sc = _masks(d, mc_top, amt_top, 80, 85)
+    d["_sc"] = sc
+    pick = d[base & d["riser"]].sort_values("rank_ratio2", ascending=False).assign(구분="순위상승")
+    return _finish(pick, n)

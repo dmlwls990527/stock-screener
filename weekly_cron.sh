@@ -37,6 +37,8 @@ run_stage "국내 분기재무 (DART)"        1800 etl_quarterly_dart.py
 run_stage "팩터분석 US" 1800 factor_analysis.py
 run_stage "팩터분석 KR" 1800 factor_analysis.py --kr
 run_stage "주도주 스크리너" 1800 leader_screener.py
+# 주도주 시트에 꾸준한 성장·순위 상승 참고 지표 + Top20진입전후보 시트 (2026-09-29)
+run_stage "성장·순위 지표 시트" 900 growth_sheet.py
 
 # --- 자동매수 후보 (2026-09-29): 오늘의 S&P 500 구성종목에서 상위 10 — 백테스트(replay sp500_pit)와 같은 정의 ---
 # 편입·편출 이력 파일을 먼저 갱신한다 (실패하면 기존 파일 그대로 사용)
