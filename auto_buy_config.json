@@ -1,31 +1,33 @@
 {
   "mode": "paper",
   "source": {
-    "file": "/data/frame/leader_watchlist_latest.xlsx",
-    "sheet": "주도주",
-    "sort_by": "주도주점수",
-    "top_n": 50,
+    "file": "/data/frame/auto_buy_candidates_latest.xlsx",
+    "sheet": "자동매수후보",
+    "sort_by": "우선점수",
+    "top_n": 10,
     "exclude_if_주의": false,
     "exclude_sectors": [],
     "exclude_tickers": []
   },
   "sizing": {
     "per_stock_usd": 1000,
-    "max_positions": 50,
+    "max_positions": 10,
     "weekly_cap_usd": 3000,
     "skip_if_held": true,
     "order_type": "MARKET",
     "use_amount_orders": true,
     "limit_offset_pct": 0.5,
     "min_order_usd": 20,
-    "method": "score_weight"
+    "method": "score_weight",
+    "weighting": "rank"
   },
   "exit": {
     "enabled": true,
     "trailing_stop_pct": 0,
     "gate_absent_weeks": 1,
     "rule": "drop_from_list",
-    "weeks_absent": 2
+    "weeks_absent": 2,
+    "stop_type": "fixed"
   },
   "paper": {
     "initial_cash_usd": 0,
@@ -47,11 +49,20 @@
     "account_seq": null
   },
   "replay": {
-    "financial_lag_days": 45
+    "financial_lag_days": 45,
+    "universe": "sp500_pit"
   },
   "rebalance": {
     "mode": "C",
     "topup_threshold_pct": 30,
     "every_weeks": 3
+  },
+  "candidates": {
+    "mode": "top_fill",
+    "n": 10,
+    "mc_top": 0.97,
+    "amt_top": 0.66,
+    "rs_min": 80,
+    "high_min": 85
   }
 }

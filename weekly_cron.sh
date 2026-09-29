@@ -38,6 +38,11 @@ run_stage "팩터분석 US" 1800 factor_analysis.py
 run_stage "팩터분석 KR" 1800 factor_analysis.py --kr
 run_stage "주도주 스크리너" 1800 leader_screener.py
 
+# --- 자동매수 후보 (2026-09-29): 오늘의 S&P 500 구성종목에서 상위 10 — 백테스트(replay sp500_pit)와 같은 정의 ---
+# 편입·편출 이력 파일을 먼저 갱신한다 (실패하면 기존 파일 그대로 사용)
+curl -s -L --max-time 60 -o data/sp500_ticker_start_end.csv.new   "https://raw.githubusercontent.com/fja05680/sp500/master/sp500_ticker_start_end.csv"   && [ -s data/sp500_ticker_start_end.csv.new ] && mv data/sp500_ticker_start_end.csv.new data/sp500_ticker_start_end.csv
+run_stage "자동매수 후보 (S&P500 상위10)" 900 auto_candidates.py
+
 # 구형 스크리너(monthly_top50 / theme_daily / sector_screen / theme_screen)는 2026-09-03 제외.
 # 6월에 만든 모멘텀·테마 팩터 기반인데, 이후 IC 검증에서 예측력이 유의하지 않게 나와
 # leader_screener(주도주/펀더가속/순위상승)로 대체됐다. 매주 안 보는 파일만 만들며
