@@ -1250,7 +1250,7 @@ def build_parser():
     rr.add_argument("--refresh", action="store_true", help="스크리닝 캐시 무시하고 다시 계산")
     rr.add_argument("--out", default=None, help="결과 엑셀 경로 (기본 paper_replay_latest.xlsx)")
     rr.add_argument("--compare", action="store_true", help="여러 설정을 같은 스크리닝으로 비교")
-    rr.add_argument("--universe", default=None, choices=["db", "sp500_pit"],
+    rr.add_argument("--universe", default=None, choices=["db", "sp500_pit", "ndx_pit"],
                     help="db = DB 전체(현재 구성) / sp500_pit = 그 시점 S&P 500 구성종목")
     rr.add_argument("--compare-set", default="rebal", choices=["rebal", "rules", "grid", "stops", "final", "growth", "amt"],
                     help="rebal = 리밸런스 주기·종목수·손절 비교 / rules = v1·v2-A/B/C")

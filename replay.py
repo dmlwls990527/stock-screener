@@ -166,8 +166,37 @@ SP500_ALIASES = {
     "WBD": ["DISCA"], "WTW": ["WLTW"], "CTRA": ["COG"], "DAY": ["CDAY"], "FISV": ["FI"], "LIN": ["PX"],
     "DD": ["DWDP"],
 }
-UNIVERSES = ("db", "sp500_pit")
+# 나스닥100: github.com/jmccarrell/n100tickers 연도별 변경 파일 → ndx_intervals.py 로 만든 구간 CSV
+NDX_FILE = os.path.join(BASE_DIR, "data", "ndx_ticker_start_end.csv")
+NDX_EXTRA_ALIASES = {"BKNG": ["PCLN"]}      # S&P 이력 파일은 이미 BKNG 로 이어져 있었다
+UNIVERSES = ("db", "sp500_pit", "ndx_pit")
 _SP500 = None
+_IDX = {}
+
+
+def index_intervals(universe):
+    """sp500_pit / ndx_pit 편입·편출 구간 (지금 티커로 이은 것)."""
+    if universe in _IDX:
+        return _IDX[universe]
+    path = SP500_FILE if universe == "sp500_pit" else NDX_FILE
+    aliases = dict(SP500_ALIASES)
+    if universe == "ndx_pit":
+        for k, v in NDX_EXTRA_ALIASES.items():
+            aliases[k] = list(aliases.get(k, [])) + v
+    m = pd.read_csv(path, dtype=str, keep_default_na=False)
+    m["ticker"] = m["ticker"].astype(str).str.strip().str.replace(".", "-", regex=False)
+    old2new = {o: n for n, olds in aliases.items() for o in olds}
+    m["ticker"] = m["ticker"].map(lambda t: old2new.get(t, t))
+    m["start_date"] = pd.to_datetime(m["start_date"])
+    m["end_date"] = pd.to_datetime(m["end_date"].replace("", None)).fillna(pd.Timestamp("2262-01-01"))
+    _IDX[universe] = m
+    return m
+
+
+def index_members(asof, universe):
+    m = index_intervals(universe)
+    t = pd.Timestamp(asof)
+    return set(m[(m["start_date"] <= t) & (m["end_date"] > t)]["ticker"])
 
 
 def sp500_intervals():
@@ -271,7 +300,7 @@ def screen_asof(asof, refresh=False, use_cache=True, lag_days=DEFAULT_FIN_LAG_DA
     L = screener()
     t0 = time.time()
     import contextlib
-    members = sp500_members(asof) if universe == "sp500_pit" else None
+    members = index_members(asof, universe) if universe in ("sp500_pit", "ndx_pit") else None
     pit = _PointInTimeUniverse(L, members) if members is not None else contextlib.nullcontext()
     pit.__enter__()
     try:
@@ -872,8 +901,9 @@ def build_summary(res, cfg, cadence, split_events=None):
         ("리밸런스 구간", f"{dates[0]} ~ {dates[-1]}" if dates else "-"),
         ("주기", cadence),
         ("규칙", res.get("rule_label") or strategy.rule_label(cfg)),
-        ("유니버스", "그 시점 S&P 500 구성종목 (point-in-time, 상장폐지 종목은 가격이 없어 빠짐)"
-         if (cfg.get("replay") or {}).get("universe") == "sp500_pit" else "DB 전체 = 현재 구성종목 (선견·생존 편향 있음)"),
+        ("유니버스", {"sp500_pit": "그 시점 S&P 500 구성종목 (point-in-time, 상장폐지 종목은 가격이 없어 빠짐)",
+                   "ndx_pit": "그 시점 나스닥100 구성종목 (point-in-time, 상장폐지 종목은 가격이 없어 빠짐)"}.get(
+            (cfg.get("replay") or {}).get("universe"), "DB 전체 = 현재 구성종목 (선견·생존 편향 있음)")),
         ("매도 사유별 건수(추적손절/게이트탈락/비중초과)", "{stop} / {gate} / {trim}".format(**res["counters"])
          if res.get("counters") else "-"),
         ("리밸런스 횟수", len(res["rebal_summary"])),

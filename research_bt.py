@@ -155,6 +155,8 @@ def stats(eq, days_all):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--period", choices=list(PERIODS), default="design")
+    ap.add_argument("--universe", choices=["sp500_pit", "ndx_pit"], default="sp500_pit",
+                    help="ndx_pit 이면 모멘텀 상위 20 (C2 는 상위 40 중 이익률 20), C3·C4 는 생략")
     a = ap.parse_args()
     start, end = PERIODS[a.period]
     latest = replay.db_latest_date()
@@ -173,22 +175,24 @@ def main():
     for T, D in sig.items():
         if D < days[0] or D > days[-1]:
             continue
-        mem = replay.sp500_members(T)
+        mem = replay.index_members(T, a.universe)
         m = mom_scores(cl, T, mem)
-        if len(m) < 60:
+        N = 50 if a.universe == "sp500_pit" else 20
+        if len(m) < 3 * N // 2:
             continue
-        top50 = m.nlargest(50).index
-        w1[D] = pd.Series(1 / 50, index=top50)
-        top100 = m.nlargest(100).index
+        top50 = m.nlargest(N).index
+        w1[D] = pd.Series(1 / N, index=top50)
+        top100 = m.nlargest(2 * N).index
         mg, opi = ttm_margin(fin, T)
         q = mg.reindex(top100)
         q = q[(opi.reindex(top100) > 0) & q.notna()]
-        pick = q.nlargest(50).index
+        pick = q.nlargest(N).index
         if len(pick):
             w2[D] = pd.Series(1 / len(pick), index=pick)
     first_signal = min(w1)
     d1 = [d for d in days if d >= first_signal]
-    for name, W in (("C1 12-1모멘텀 상위50", w1), ("C2 모멘텀+이익률 상위50", w2)):
+    tagN = "상위50" if a.universe == "sp500_pit" else "나스닥100 상위20"
+    for name, W in ((f"C1 12-1모멘텀 {tagN}", w1), (f"C2 모멘텀+이익률 {tagN}", w2)):
         eq, b = run_book(d1, op, cl, W)
         res[name] = eq
         extra[name] = {"누적수수료$": round(b.fees, 0), "연회전율%": round(b.turn / eq.mean() / ((len(d1)) / 252) * 100, 0)}
@@ -248,7 +252,7 @@ def main():
     pd.set_option("display.width", 250)
     print(tab.to_string(index=False))
     print(ydf.to_string())
-    out = f"/data/frame/research_{a.period}.xlsx"
+    out = f"/data/frame/research_{a.period}" + ("" if a.universe == "sp500_pit" else "_ndx") + ".xlsx"
     with pd.ExcelWriter(out, engine="openpyxl") as xw:
         tab.to_excel(xw, sheet_name="요약", index=False)
         ydf.to_excel(xw, sheet_name="연도별")
