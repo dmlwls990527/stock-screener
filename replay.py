@@ -150,8 +150,72 @@ def _warn(r):
 
 
 # ── as-of 스크리닝 (캐시) ────────────────────────────────────────────────
-def cache_path(asof, lag_days=DEFAULT_FIN_LAG_DAYS):
-    return os.path.join(CACHE_DIR, f"screen_{CACHE_VER}_lag{int(lag_days)}_{asof}.pkl")
+
+# ── 시점별 유니버스: 그 날짜에 실제로 S&P 500 에 있던 종목만 (2026-09-29) ─────────
+# 왜: DB 유니버스는 '지금의' S&P 500 + 나스닥100 이라 PLTR·HOOD·AXON 처럼 크게 오른 뒤 편입된 종목이
+#     과거에도 후보에 들어간다(선견 편향). 편입·편출 이력 = github.com/fja05680/sp500 sp500_ticker_start_end.csv
+# 남는 편향: 그 시절 구성종목 중 상장폐지·피인수된 곳은 야후에 가격이 없어 빠진다(생존 편향 일부 잔존).
+# 티커 변경: 이력 파일은 그때 티커로 적혀 있어 지금 티커로 잇는다. 확실한 이름변경/승계만 (합병 신설은 제외).
+SP500_FILE = os.path.join(BASE_DIR, "data", "sp500_ticker_start_end.csv")
+SP500_ALIASES = {
+    "META": ["FB"], "ELV": ["ANTM"], "BALL": ["BLL"], "BBWI": ["LB"], "BKR": ["BHGE"], "BNY": ["BK"],
+    "COR": ["ABC"], "CPAY": ["FLT"], "DOC": ["PEAK", "HCP"], "EG": ["RE"], "GEN": ["NLOK", "SYMC"],
+    "GL": ["TMK"], "HWM": ["ARNC"], "J": ["JEC"], "LHX": ["HRS"], "LUMN": ["CTL"], "MRSH": ["MMC"],
+    "PSKY": ["PARA", "VIAC", "CBS"], "RTX": ["UTX"], "RVTY": ["PKI"], "TFC": ["BBT"], "VTRS": ["MYL"],
+    "WBD": ["DISCA"], "WTW": ["WLTW"], "CTRA": ["COG"], "DAY": ["CDAY"], "FISV": ["FI"], "LIN": ["PX"],
+    "DD": ["DWDP"],
+}
+UNIVERSES = ("db", "sp500_pit")
+_SP500 = None
+
+
+def sp500_intervals():
+    global _SP500
+    if _SP500 is None:
+        m = pd.read_csv(SP500_FILE)
+        m["ticker"] = m["ticker"].astype(str).str.strip().str.replace(".", "-", regex=False)
+        old2new = {o: n for n, olds in SP500_ALIASES.items() for o in olds}
+        m["ticker"] = m["ticker"].map(lambda t: old2new.get(t, t))
+        m["start_date"] = pd.to_datetime(m["start_date"])
+        m["end_date"] = pd.to_datetime(m["end_date"]).fillna(pd.Timestamp("2262-01-01"))
+        _SP500 = m
+    return _SP500
+
+
+def sp500_members(asof):
+    """asof 에 S&P 500 구성종목이던 티커(지금 티커로 이은 것)."""
+    m = sp500_intervals()
+    t = pd.Timestamp(asof)
+    return set(m[(m["start_date"] <= t) & (m["end_date"] > t)]["ticker"])
+
+
+class _PointInTimeUniverse:
+    """leader_screener.dq 를 잠깐 감싸 CODE 가 구성종목인 행만 돌려준다 → 시총표·재무 z·RS 백분위가
+    전부 그 시점 구성종목 안에서 계산된다. leader_screener 는 고치지 않는다."""
+
+    def __init__(self, L, members):
+        self.L, self.members, self.orig = L, set(members), None
+
+    def __enter__(self):
+        self.orig = self.L.dq
+        orig, mem = self.orig, self.members
+
+        def dq(sql):
+            d = orig(sql)
+            if isinstance(d, pd.DataFrame) and "CODE" in d.columns:
+                d = d[d["CODE"].isin(mem)].reset_index(drop=True)
+            return d
+        self.L.dq = dq
+        return self
+
+    def __exit__(self, *exc):
+        self.L.dq = self.orig
+        return False
+
+
+def cache_path(asof, lag_days=DEFAULT_FIN_LAG_DAYS, universe="db"):
+    tag = "" if universe == "db" else f"{universe.replace('_', '')}_"
+    return os.path.join(CACHE_DIR, f"screen_{CACHE_VER}_lag{int(lag_days)}_{tag}{asof}.pkl")
 
 
 _warned_stale = False
@@ -178,18 +242,21 @@ class _LaggedFinancials:
         return False
 
 
-def screen_asof(asof, refresh=False, use_cache=True, lag_days=DEFAULT_FIN_LAG_DAYS):
+def screen_asof(asof, refresh=False, use_cache=True, lag_days=DEFAULT_FIN_LAG_DAYS, universe="db"):
     """asof 시점의 주도주 목록을 screen_now() 와 같은 순서로 재현.
     lag_days: 분기말(END_DATE) 이 asof − lag_days 이전인 분기 재무만 쓴다 (공시 지연 흉내, 캐시 키에 포함).
     반환 dict: {asof, watchlist(주도주 시트와 같은 한글 열), universe(축약 열), n_universe, elapsed, cached}
     factor_eval.py 58~117행의 재현 순서를 복사한 것 — leader_screener 는 수정하지 않는다."""
     global _warned_stale
-    path = cache_path(asof, lag_days)
+    if universe not in UNIVERSES:
+        raise ValueError(f"replay.universe 는 {UNIVERSES} 중 하나: {universe!r}")
+    path = cache_path(asof, lag_days, universe)
     if use_cache and not refresh and os.path.exists(path):
         try:
             with open(path, "rb") as f:
                 d = pickle.load(f)
-            if d.get("ver") == CACHE_VER and "watchlist" in d and int(d.get("lag_days", -1)) == int(lag_days):
+            if (d.get("ver") == CACHE_VER and "watchlist" in d and int(d.get("lag_days", -1)) == int(lag_days)
+                    and d.get("universe_mode", "db") == universe):
                 d["cached"] = True
                 ls = os.path.join(BASE_DIR, "leader_screener.py")
                 if (not _warned_stale and os.path.exists(ls)
@@ -202,40 +269,48 @@ def screen_asof(asof, refresh=False, use_cache=True, lag_days=DEFAULT_FIN_LAG_DA
 
     L = screener()
     t0 = time.time()
-    with _LaggedFinancials(L, asof, lag_days):
-        df = L.build(asof)
-    wl = empty_watchlist()
-    if df.empty:
-        uni = pd.DataFrame(columns=UNIVERSE_COLS)
-    else:
-        # screen_now() 와 같은 순서: 섹터 매핑 → 부동산 제외 → price_metrics 병합 → 순위 재계산 → build_leaders
-        sec = L.fa.get_sector_map(L.conn, "ticker_master_us") if hasattr(L.fa, "get_sector_map") else {}
-        nm = L.fa.get_name_map(L.conn, "ticker_master_us") if hasattr(L.fa, "get_name_map") else {}
-        df["NAME"] = df["CODE"].map(nm) if nm else ""
-        # 주의: 섹터·이름은 현재 시점 매핑이라 과거 시점엔 미세한 선견이 있다 (factor_eval 과 동일)
-        df["섹터"] = df["CODE"].map(lambda c: SKO.get(sec.get(c, ""), (sec.get(c, "") or "?")))
-        df = df[df["섹터"] != "부동산"].copy()
-        try:
-            pm = L.price_metrics(asof)
-            if not pm.empty:
-                df = df.merge(pm, on="CODE", how="left")
-        except Exception as e:
-            log.warning("  [경고] %s price_metrics 실패: %s", asof, str(e)[:70])
-        df["trackA_rank"] = df["fund_rank_key"].rank(ascending=False, method="min").astype(int)
-        df["유형"] = df.apply(lambda r: _typ(r, L.CYC_HARD, L.CYC_STD_T, L.CYC_TREND_T), axis=1)
-        df["주의"] = df.apply(_warn, axis=1)
-        if "rs_pct" in df.columns:
-            df, lead = L.build_leaders(df)
+    import contextlib
+    members = sp500_members(asof) if universe == "sp500_pit" else None
+    pit = _PointInTimeUniverse(L, members) if members is not None else contextlib.nullcontext()
+    pit.__enter__()
+    try:
+        with _LaggedFinancials(L, asof, lag_days):
+            df = L.build(asof)
+        wl = empty_watchlist()
+        if df.empty:
+            uni = pd.DataFrame(columns=UNIVERSE_COLS)
         else:
-            lead = pd.DataFrame()
-        if len(lead):
-            cols = [c for c in CCOL if c in lead.columns]
-            wl = lead[cols].rename(columns=KOR).reset_index(drop=True)
-        uni = df[[c for c in UNIVERSE_COLS if c in df.columns]].copy()
+            # screen_now() 와 같은 순서: 섹터 매핑 → 부동산 제외 → price_metrics 병합 → 순위 재계산 → build_leaders
+            sec = L.fa.get_sector_map(L.conn, "ticker_master_us") if hasattr(L.fa, "get_sector_map") else {}
+            nm = L.fa.get_name_map(L.conn, "ticker_master_us") if hasattr(L.fa, "get_name_map") else {}
+            df["NAME"] = df["CODE"].map(nm) if nm else ""
+            # 주의: 섹터·이름은 현재 시점 매핑이라 과거 시점엔 미세한 선견이 있다 (factor_eval 과 동일)
+            df["섹터"] = df["CODE"].map(lambda c: SKO.get(sec.get(c, ""), (sec.get(c, "") or "?")))
+            df = df[df["섹터"] != "부동산"].copy()
+            try:
+                pm = L.price_metrics(asof)
+                if not pm.empty:
+                    df = df.merge(pm, on="CODE", how="left")
+            except Exception as e:
+                log.warning("  [경고] %s price_metrics 실패: %s", asof, str(e)[:70])
+            df["trackA_rank"] = df["fund_rank_key"].rank(ascending=False, method="min").astype(int)
+            df["유형"] = df.apply(lambda r: _typ(r, L.CYC_HARD, L.CYC_STD_T, L.CYC_TREND_T), axis=1)
+            df["주의"] = df.apply(_warn, axis=1)
+            if "rs_pct" in df.columns:
+                df, lead = L.build_leaders(df)
+            else:
+                lead = pd.DataFrame()
+            if len(lead):
+                cols = [c for c in CCOL if c in lead.columns]
+                wl = lead[cols].rename(columns=KOR).reset_index(drop=True)
+            uni = df[[c for c in UNIVERSE_COLS if c in df.columns]].copy()
+    finally:
+        pit.__exit__(None, None, None)
     elapsed = time.time() - t0
     d = {"ver": CACHE_VER, "asof": asof, "lag_days": int(lag_days),
          "created": datetime.now(KST).isoformat(timespec="seconds"),
          "elapsed": round(elapsed, 1), "watchlist": wl, "universe": uni, "n_universe": len(uni),
+         "universe_mode": universe, "n_members": len(members) if members is not None else None,
          "screener_mtime": os.path.getmtime(os.path.join(BASE_DIR, "leader_screener.py"))
          if os.path.exists(os.path.join(BASE_DIR, "leader_screener.py")) else 0, "cached": False}
     if use_cache:
@@ -796,6 +871,8 @@ def build_summary(res, cfg, cadence, split_events=None):
         ("리밸런스 구간", f"{dates[0]} ~ {dates[-1]}" if dates else "-"),
         ("주기", cadence),
         ("규칙", res.get("rule_label") or strategy.rule_label(cfg)),
+        ("유니버스", "그 시점 S&P 500 구성종목 (point-in-time, 상장폐지 종목은 가격이 없어 빠짐)"
+         if (cfg.get("replay") or {}).get("universe") == "sp500_pit" else "DB 전체 = 현재 구성종목 (선견·생존 편향 있음)"),
         ("매도 사유별 건수(추적손절/게이트탈락/비중초과)", "{stop} / {gate} / {trim}".format(**res["counters"])
          if res.get("counters") else "-"),
         ("리밸런스 횟수", len(res["rebal_summary"])),
@@ -1279,8 +1356,12 @@ def compare(start=DEFAULT_START, end=None, cadence="weekly", cfg=None, out=OUT_X
     panel, split_events = load_prices(d0, end, use_cache=use_cache)
     trading_days = [d for d in panel["CLOSE"].index if d <= end]
 
+    universe = (cfg.get("replay") or {}).get("universe", "db")
+    log.info("유니버스: %s", "그 시점 S&P 500 구성종목 (point-in-time)" if universe == "sp500_pit" else "DB 전체 (현재 구성)")
+
     def screen_fn(asof):
-        return screen_asof(asof, refresh=refresh, use_cache=use_cache, lag_days=lag_days)
+        return screen_asof(asof, refresh=refresh, use_cache=use_cache, lag_days=lag_days,
+                           universe=universe)
 
     variants, main_key = VARIANT_SETS[variant_set]
     cfgs = variant_configs(cfg, variant_set)
@@ -1384,9 +1465,13 @@ def replay(start=DEFAULT_START, end=None, cadence="weekly", cfg=None, out=OUT_XL
     panel, split_events = load_prices(d0, end, use_cache=use_cache)
     trading_days = [d for d in panel["CLOSE"].index if d <= end]
 
-    def screen_fn(asof):
-        return screen_asof(asof, refresh=refresh, use_cache=use_cache, lag_days=lag_days)
+    universe = (cfg.get("replay") or {}).get("universe", "db")
 
+    def screen_fn(asof):
+        return screen_asof(asof, refresh=refresh, use_cache=use_cache, lag_days=lag_days,
+                           universe=universe)
+
+    log.info("유니버스: %s", "그 시점 S&P 500 구성종목 (point-in-time)" if universe == "sp500_pit" else "DB 전체 (현재 구성)")
     t0 = time.time()
     if cadence == "weekly":
         dates = dates[::strategy.every_weeks(cfg)]

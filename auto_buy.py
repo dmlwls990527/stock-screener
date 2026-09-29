@@ -746,6 +746,8 @@ def cmd_replay(cfg, args, inj):
     except ImportError as e:
         log.error("replay.py 를 찾을 수 없습니다 (%s). 과거 시뮬레이션 모듈이 아직 없습니다.", e)
         return 2
+    if getattr(args, "universe", None):
+        cfg = deep_merge(cfg, {"replay": {"universe": args.universe}})
     kwargs = {"cfg": cfg}
     if getattr(args, "start", None):
         kwargs["start"] = args.start
@@ -1248,6 +1250,8 @@ def build_parser():
     rr.add_argument("--refresh", action="store_true", help="스크리닝 캐시 무시하고 다시 계산")
     rr.add_argument("--out", default=None, help="결과 엑셀 경로 (기본 paper_replay_latest.xlsx)")
     rr.add_argument("--compare", action="store_true", help="여러 설정을 같은 스크리닝으로 비교")
+    rr.add_argument("--universe", default=None, choices=["db", "sp500_pit"],
+                    help="db = DB 전체(현재 구성) / sp500_pit = 그 시점 S&P 500 구성종목")
     rr.add_argument("--compare-set", default="rebal", choices=["rebal", "rules", "grid", "stops"],
                     help="rebal = 리밸런스 주기·종목수·손절 비교 / rules = v1·v2-A/B/C")
     rs = sp.add_parser("reset", parents=[common], help="페이퍼 상태 초기화")

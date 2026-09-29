@@ -490,5 +490,36 @@ class TestStopTypes(unittest.TestCase):
         self.assertEqual(strategy.every_weeks(v["T10"]), 3)
 
 
+
+
+# ── 시점별 유니버스 (S&P 500 point-in-time) ───────────────────────────────
+class TestPointInTime(unittest.TestCase):
+    def test_members_and_aliases(self):
+        m = replay.sp500_members("2020-06-01")
+        self.assertIn("META", m)            # FB 로 적힌 구간을 META 로 이음
+        self.assertIn("RTX", m)             # 2020-04-03 부터 RTX
+        self.assertNotIn("TSLA", m)         # 2020-12-21 편입
+        self.assertNotIn("PLTR", m)
+        self.assertIn("TSLA", replay.sp500_members("2021-01-04"))
+        self.assertIn("RTX", replay.sp500_members("2019-06-03"))    # UTX 구간
+        self.assertGreater(len(m), 480)
+        self.assertLess(len(m), 520)
+
+    def test_dq_filter_restores(self):
+        class FakeL:
+            @staticmethod
+            def dq(sql):
+                return pd.DataFrame({"CODE": ["AAA", "BBB", "CCC"], "X": [1, 2, 3]})
+        L = FakeL()
+        orig = L.dq
+        with replay._PointInTimeUniverse(L, {"AAA", "CCC"}):
+            self.assertEqual(L.dq("q")["CODE"].tolist(), ["AAA", "CCC"])
+        self.assertIs(L.dq, orig)
+
+    def test_cache_path_tag(self):
+        self.assertTrue(replay.cache_path("2020-01-03", 45).endswith("screen_v2_lag45_2020-01-03.pkl"))
+        self.assertTrue(replay.cache_path("2020-01-03", 45, "sp500_pit").endswith("screen_v2_lag45_sp500pit_2020-01-03.pkl"))
+
+
 if __name__ == "__main__":
     unittest.main()
