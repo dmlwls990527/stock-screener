@@ -181,3 +181,36 @@ tick 을 추가할 것 (겨울에는 `23,0-5`):
 ±3% 로 튀고 **`daily_marcap_us.STOCKS`(발행주식수)가 ±5거래일 안에 같은 배수로 변한 날만** 분할로 보고 소급 조정한다.
 STOCKS 가 안 변한 급등락(인수 발표·급락 등 진짜 가격 이벤트)은 조정하지 않고 요약 시트에 "STOCKS 미확인" 으로 따로 적는다 /
 시가 체결 가정, 배당·이자 미반영. `leader_screener.py` 를 고친 뒤에는 `--refresh` 로 캐시를 다시 만들 것(경고가 뜬다).
+
+---
+
+## v2 규칙 (2026-09-28 확정, `sizing.method = "score_weight"`)
+
+| 항목 | 값 | 설정 키 |
+|---|---|---|
+| 대상 | 주도주 시트 상위 50종 (지금은 통과 36종 전부) | `source.top_n` |
+| 자본 | 1,000만원 → 첫 초기화 때 토스 환율 × (1+0.05%) 로 달러 전환 | `paper.initial_cash_krw`, `convert_at_start` |
+| 매수 비중 | 점수 가중: 목표비중 = 내 점수 ÷ 목록 점수 합, 목표금액 = 비중 × 총자산 | — |
+| 신규 매수 | 목표금액만큼 금액주문(소수점). 현금이 모자라면 신규끼리 비중대로 축소 | `sizing.min_order_usd` |
+| 보유 종목 | **B 추가매수만**: 목표보다 30% 이상 모자라면 차이만큼 더 산다. 줄이지 않음 | `rebalance.mode` (A/B/C), `topup_threshold_pct` |
+| 매도 | 추적손절 −15% (보유 후 최고가 대비) 또는 게이트 탈락 2주 연속, 먼저 걸리는 쪽 → 전량 시장가 | `exit.trailing_stop_pct`, `exit.gate_absent_weeks` |
+| 재매수 | 제한 없음 (같은 실행 안에서 판 종목만 다시 안 삼) | — |
+| 주문 시각 | 정규장 시작 + 45분 ~ 마감 1시간 전 (금액주문 가능 구간) | `schedule.entry_offset_min` |
+
+현금 우선순위: 매도 대기 청산 → (C 모드) 비중초과 매도 → 신규 → 추가매수. 둘 다 점수 순.
+
+### 명령
+- `run` — 이번 기준일 첫 실행만 동작: 매도조건 갱신 → 매도 대기 청산 → 매수. 같은 기준일 두 번째부터는 rc 3.
+- `exits` — 매수 없이 매도 대기 종목만 청산 (화~금).
+- `tick` — 장 마감 뒤: 최고가 갱신, 추적손절 판정(다음 진입 시각에 매도), 자산 기록, 리포트 갱신.
+- `replay --compare` — v1 균등 / v2-A / v2-B / v2-C 를 같은 스크리닝으로 비교 → `paper_replay_latest.xlsx` 의 `비교` 시트.
+
+### 크론 (claude 사용자 crontab)
+```
+15 23 * * 1-5 /bin/bash /data/frame/auto_buy_cron.sh run exits
+15 0  * * 2-6 /bin/bash /data/frame/auto_buy_cron.sh run exits
+10 6  * * 2-6 /bin/bash /data/frame/auto_buy_cron.sh tick
+```
+23:15 와 00:15 두 번 거는 이유: 서머타임엔 정규장이 22:30, 겨울엔 23:30 에 열린다. 진입 창(+45분)에 맞지 않는 쪽은 rc 3 으로 그냥 끝난다.
+`run` 을 매일 거는 이유: 월요일이 미국 휴장이면 화요일에 그 주 매수를 한다 (이미 했으면 rc 3).
+로그: `logs/auto_buy_cron_YYYYMM.log` + `logs/auto_buy_YYYYMMDD.log`.

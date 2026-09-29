@@ -4,43 +4,53 @@
     "file": "/data/frame/leader_watchlist_latest.xlsx",
     "sheet": "주도주",
     "sort_by": "주도주점수",
-    "top_n": 5,
-    "exclude_if_주의": true,
+    "top_n": 50,
+    "exclude_if_주의": false,
     "exclude_sectors": [],
     "exclude_tickers": []
   },
   "sizing": {
     "per_stock_usd": 1000,
-    "max_positions": 10,
+    "max_positions": 50,
     "weekly_cap_usd": 3000,
     "skip_if_held": true,
     "order_type": "MARKET",
     "use_amount_orders": true,
     "limit_offset_pct": 0.5,
-    "min_order_usd": 50
+    "min_order_usd": 20,
+    "method": "score_weight"
   },
   "exit": {
-    "enabled": false,
+    "enabled": true,
+    "trailing_stop_pct": 15,
+    "gate_absent_weeks": 2,
     "rule": "drop_from_list",
     "weeks_absent": 2
   },
   "paper": {
-    "initial_cash_usd": 10000,
-    "initial_cash_krw": 0,
+    "initial_cash_usd": 0,
+    "initial_cash_krw": 10000000,
     "slippage_bps": 5,
     "commission_pct": 0.1,
     "fx_spread_pct_market": 0.05,
     "fx_spread_pct_off": 0.5,
     "auto_fx": false,
-    "state_path": "/data/frame/paper/paper_state.json"
+    "state_path": "/data/frame/paper/paper_state.json",
+    "convert_at_start": true,
+    "fx_rate": 1357.2
   },
   "schedule": {
-    "place_at_session": "regularMarket"
+    "place_at_session": "regularMarket",
+    "entry_offset_min": 45
   },
   "live": {
     "account_seq": null
   },
   "replay": {
     "financial_lag_days": 45
+  },
+  "rebalance": {
+    "mode": "B",
+    "topup_threshold_pct": 30
   }
 }

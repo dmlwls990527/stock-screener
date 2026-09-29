@@ -28,14 +28,15 @@ import logging
 import os
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE_DIR)
 
 import rules                                     # noqa: E402
+import strategy                                  # noqa: E402  (v2 규칙)
 from broker_paper import (PaperBroker, KST, now_kst, session_from_calendar,   # noqa: E402
-                          fmt_ts, StateFileError)
+                          fmt_ts, parse_ts, StateFileError)
 
 DEFAULT_CONFIG_PATH = os.path.join(BASE_DIR, "auto_buy_config.json")
 DEFAULT_CONFIG = {
@@ -58,8 +59,11 @@ DEFAULT_CONFIG = {
         "use_amount_orders": True,
         "limit_offset_pct": 0.5,
         "min_order_usd": 50,
+        "method": "equal",          # equal = v1 (종목당 고정금액) / score_weight = v2 (점수 가중 목표비중)
     },
-    "exit": {"enabled": False, "rule": "drop_from_list", "weeks_absent": 2},
+    "rebalance": {"mode": "B", "topup_threshold_pct": 30},   # v2: A 안건드림 / B 추가매수만 / C 양방향
+    "exit": {"enabled": False, "rule": "drop_from_list", "weeks_absent": 2,
+             "trailing_stop_pct": 15, "gate_absent_weeks": 2},       # v2 는 뒤의 두 키를 쓴다
     "paper": {
         "initial_cash_usd": 10000,
         "initial_cash_krw": 0,
@@ -69,8 +73,10 @@ DEFAULT_CONFIG = {
         "fx_spread_pct_off": 0.5,
         "auto_fx": False,
         "state_path": "/data/frame/paper/paper_state.json",
+        "convert_at_start": False,  # True 면 첫 초기화 때 KRW 전액을 토스 환율×(1+장중 스프레드)로 USD 전환
+        "fx_rate": 1357.2,          # 환율 조회 실패 시 쓰는 값 (KRW per USD)
     },
-    "schedule": {"place_at_session": "regularMarket"},
+    "schedule": {"place_at_session": "regularMarket", "entry_offset_min": 45},
     "live": {"account_seq": None},
     # replay 전용: 분기 재무를 분기말(END_DATE) + N일 뒤에야 안 것으로 취급 (10-Q 제출 지연 흉내)
     "replay": {"financial_lag_days": 45},
@@ -250,8 +256,10 @@ def make_paper_broker(cfg, quote_fn=None, session_fn=None, calendar_fn=None,
         fx_fn = toss_fx_rate
     state_path = cfg["paper"].get("state_path") or os.path.join(BASE_DIR, "paper", "paper_state.json")
     os.makedirs(os.path.dirname(os.path.abspath(state_path)), exist_ok=True)
-    return PaperBroker(state_path, quote_fn, session_fn, cfg["paper"],
-                       calendar_fn=calendar_fn, now_fn=now_fn, fx_fn=fx_fn)
+    broker = PaperBroker(state_path, quote_fn, session_fn, cfg["paper"],
+                         calendar_fn=calendar_fn, now_fn=now_fn, fx_fn=fx_fn)
+    ensure_initial_fx(broker, cfg)
+    return broker
 
 
 def live_lock_status(cfg, args):
@@ -264,7 +272,7 @@ def live_lock_status(cfg, args):
         return False, "설정이 mode=live 인데 --live 플래그가 없음 → 차단 (페이퍼로 돌리려면 mode 를 paper 로)"
     if flag_live and not mode_live:
         return False, "--live 플래그가 있는데 설정 mode 가 live 가 아님 → 차단"
-    if getattr(args, "cmd", "") == "run":
+    if getattr(args, "cmd", "") in ("run", "exits"):
         if os.environ.get("AUTO_BUY_LIVE_OK") != "1":
             return False, "환경변수 AUTO_BUY_LIVE_OK=1 이 없음 → 실계좌 주문 차단"
     return True, None
@@ -277,7 +285,7 @@ def make_broker(cfg, args, inj):
         raise PermissionError(why)
     if not is_live:
         return make_paper_broker(cfg, **inj), False
-    if getattr(args, "cmd", "") == "run" and sys.stdin.isatty():
+    if getattr(args, "cmd", "") in ("run", "exits") and sys.stdin.isatty():
         typed = input("실계좌 주문입니다. 계속하려면 LIVE 를 입력: ")
         if typed.strip() != "LIVE":
             raise PermissionError("확인 문자열 불일치 → 실계좌 주문 차단")
@@ -476,6 +484,8 @@ def _place(broker, o):
 
 # ── 서브커맨드 ────────────────────────────────────────────────────────────
 def cmd_plan(cfg, args, inj):
+    if is_v2(cfg):
+        return cmd_plan_v2(cfg, args, inj)
     broker, is_live = make_broker(cfg, args, inj)
     info = build_plan(cfg, broker)
     if info is None:
@@ -505,6 +515,8 @@ def _empty_plan_verdict(info):
 
 
 def cmd_run(cfg, args, inj):
+    if is_v2(cfg):
+        return cmd_run_v2(cfg, args, inj)
     broker, is_live = make_broker(cfg, args, inj)
     tag = "LIVE 실계좌" if is_live else "PAPER 모의"
     log.info("===== run [%s] %s =====", tag, fmt_ts(now_kst()))
@@ -580,6 +592,8 @@ def cmd_run(cfg, args, inj):
 
 def cmd_tick(cfg, args, inj):
     broker, is_live = make_broker(cfg, args, inj)
+    if is_v2(cfg):
+        watch_exits(cfg, broker, where="tick")
     if not hasattr(broker, "tick"):
         log.info("LIVE 브로커는 tick 대상이 아님 (미체결은 토스 서버가 관리). 상태만 출력.")
         _print_summary(broker)
@@ -598,10 +612,15 @@ def cmd_tick(cfg, args, inj):
             s = ev["snapshot"]
             log.info("  평가 %s 총자산 $%.2f (현금 $%.2f, 주식 $%.2f)", s["ts"], s["equity_usd"],
                      s["cash_usd"], s["positions_value"])
+    if is_v2(cfg) and not is_live:
+        try:
+            cmd_report(cfg, argparse.Namespace(out=None), inj)
+        except Exception as e:
+            log.warning("리포트 갱신 실패: %s", e)
     return 0
 
 
-def _print_summary(broker):
+def _print_summary(broker, cfg=None):
     if not hasattr(broker, "summary"):
         try:
             log.info("보유: %s", broker.holdings())
@@ -630,13 +649,25 @@ def _print_summary(broker):
     for o in broker.open_orders():
         log.info("  미체결 %s %s %s %s주 @%s 만료 %s (id %s)", o["symbol"], o["side"], o["orderType"],
                  o.get("quantity"), o.get("price"), o.get("expiresAt"), o["orderId"])
+    es = broker_meta_get(broker, "exit_state") or {}
+    if es:
+        pct = strategy.exit_cfg(cfg)["trailing_stop_pct"] if cfg and is_v2(cfg) else 15
+        for sym, st in sorted(es.items()):
+            sp = strategy.stop_price(st, pct)
+            log.info("  매도조건 %-6s 최고가 %s 손절가 %s 탈락주수 %s %s", sym,
+                     f"{st['high_water']:.2f}" if st.get('high_water') else '-',
+                     f"{sp:.2f}" if sp else '-', st.get('absent_weeks', 0),
+                     ('→ 매도대기: ' + st['pending_exit']['reason']) if st.get('pending_exit') else '')
+    if s.get("initial_krw"):
+        log.info("초기자본 %s원 → $%.2f (환율 %s, 스프레드 %s%%)", f"{s['initial_krw']:,.0f}",
+                 s["initial_equity_usd"], s.get("initial_fx_rate"), s.get("initial_fx_spread_pct"))
     log.info("마지막 실행 기준일 %s (%s)", s["last_run_asof"], s["last_run_ts"])
 
 
 def cmd_status(cfg, args, inj):
     broker, is_live = make_broker(cfg, args, inj)
-    log.info("모드 %s", mode_label(cfg))
-    _print_summary(broker)
+    log.info("모드 %s | 규칙 %s", mode_label(cfg), rule_label(cfg))
+    _print_summary(broker, cfg)
     return 0
 
 
@@ -657,7 +688,7 @@ def cmd_report(cfg, args, inj):
     fetch_quotes(broker, list(broker.holdings()))
     s = broker.summary()
     positions, fills, equity = broker.to_frames()
-    out = getattr(args, "out", None) or os.path.join(BASE_DIR, "paper_report_latest.xlsx")
+    out = getattr(args, "out", None) or os.path.join(os.path.dirname(paper_dir(cfg)), "paper_report_latest.xlsx")
 
     summary_rows = [
         ("기준시각", s["ts"]), ("모드", "PAPER 모의"), ("현재세션", s["session"] or "장외"),
@@ -674,11 +705,18 @@ def cmd_report(cfg, args, inj):
         ("체결건수", s["fills"]), ("거절건수", s["rejected"]),
         ("마지막실행기준일", s["last_run_asof"] or "-"), ("마지막실행시각", s["last_run_ts"] or "-"),
         ("계좌생성", s["created"]),
+        ("초기자본(KRW)", s.get("initial_krw") or "-"),
+        ("USD 전환 환율(KRW/USD, 스프레드 전)", s.get("initial_fx_rate") or "-"),
+        ("전환 스프레드%", s.get("initial_fx_spread_pct") if s.get("initial_fx_spread_pct") is not None else "-"),
+        ("현금비중%", round(s["cash_usd"] / s["equity_usd"] * 100, 2) if s["equity_usd"] else "-"),
+        ("규칙", rule_label(cfg)),
     ]
     summary_df = pd.DataFrame(summary_rows, columns=["항목", "값"])
     pos_df = positions.rename(columns={
         "symbol": "티커", "qty": "수량", "avg_price": "평균단가", "price": "현재가", "value": "평가금액",
         "unrealized": "평가손익", "pnl_pct": "수익률%", "opened": "매수일", "stale": "시세지연"})
+    if is_v2(cfg):
+        pos_df = add_v2_columns(cfg, pos_df, broker)
     fills_df = fills.rename(columns={
         "ts": "체결시각", "orderId": "주문ID", "clientOrderId": "클라이언트주문ID", "symbol": "티커",
         "side": "매매", "orderType": "주문유형", "qty": "수량", "fillPrice": "체결가", "quotePrice": "시세",
@@ -719,6 +757,10 @@ def cmd_replay(cfg, args, inj):
         kwargs["refresh"] = True
     if getattr(args, "out", None):
         kwargs["out"] = args.out
+    if getattr(args, "compare", False):
+        res = replay.compare(**kwargs)
+        log.info("비교 결과:\n%s", res.to_string(index=False) if hasattr(res, "to_string") else res)
+        return 0
     log.info("replay 시작 %s (기준일마다 스크리닝 10~20s, 캐시 paper/replay_cache/ 에 있으면 즉시)",
              {k: v for k, v in kwargs.items() if k != "cfg"})
     res = replay.replay(**kwargs)          # 페이퍼 상태(paper_state.json)는 건드리지 않음 — replay_state.json 별도
@@ -739,6 +781,7 @@ def cmd_reset(cfg, args, inj):
             return 0
     broker = make_paper_broker(cfg, **inj)
     broker.reset()
+    ensure_initial_fx(broker, cfg)
     log.info("페이퍼 상태 초기화 완료: USD %.2f / KRW %.0f (%s)",
              broker.state["cash"]["USD"], broker.state["cash"]["KRW"], sp)
     return 0
@@ -750,7 +793,377 @@ def cmd_config(cfg, args, inj):
     return 0
 
 
-COMMANDS = {"plan": cmd_plan, "run": cmd_run, "tick": cmd_tick, "status": cmd_status,
+# ── v2 규칙 (strategy.py) ─────────────────────────────────────────────────
+# 2026-09-28 사용자 확정: 상위 50 · 점수가중 · 1,000만원 · 개장 +45분 시장가 ·
+# 추적손절 −15% / 게이트탈락 2주 · 보유종목 추가매수만(B). sizing.method == "score_weight" 일 때 동작.
+is_v2 = strategy.is_v2
+rule_label = strategy.rule_label
+
+
+def ensure_initial_fx(broker, cfg):
+    """paper.convert_at_start 이면 첫 초기화 때 KRW 전액을 USD 로 바꾼다 (한 번만).
+    환율 = 토스 환율 조회(실패 시 paper.fx_rate) × (1 + 장중 스프레드 fx_spread_pct_market%).
+    원화로 달러를 사므로 스프레드만큼 달러가 적게 나온다."""
+    p = cfg.get("paper") or {}
+    if not p.get("convert_at_start"):
+        return
+    st = broker.state
+    if st["meta"].get("initial_equity_usd") is not None or st["fills"] or st["open_orders"]:
+        return
+    krw = float(st["cash"].get("KRW") or 0.0)
+    if krw <= 0:
+        return
+    rate = float(broker._fx_rate())
+    spread = float(p.get("fx_spread_pct_market", 0.05))
+    usd = strategy.floor2(krw / (rate * (1 + spread / 100.0)))
+    st["cash"]["USD"] = float(st["cash"].get("USD") or 0.0) + usd
+    st["cash"]["KRW"] = 0.0
+    st.setdefault("fx_events", []).append({"ts": fmt_ts(broker._now()), "krw": krw, "usd": usd,
+                                           "rate": rate, "spread_pct": spread, "note": "초기 전환"})
+    st["meta"].update(initial_equity_usd=st["cash"]["USD"], initial_krw=krw,
+                      initial_fx_rate=rate, initial_fx_spread_pct=spread)
+    broker.save()
+    log.info("초기자본 %s원 → $%.2f 전환 (환율 %.2f × (1+%.2f%%))", f"{krw:,.0f}", usd, rate, spread)
+
+
+def load_context(cfg):
+    """워치리스트 → {df, asof, cands(top_n), dropped, listed(시트 전체 티커 = 게이트 통과 목록)}."""
+    src = cfg["source"]
+    try:
+        df, asof = rules.load_watchlist(src["file"], src.get("sheet", "주도주"))
+    except FileNotFoundError:
+        log.error("워치리스트 파일 없음: %s", src["file"])
+        return None
+    except ValueError as e:
+        log.error("워치리스트 읽기 실패 %s: %s", src["file"], e)
+        return None
+    if not asof:
+        asof = datetime.fromtimestamp(os.path.getmtime(src["file"]), KST).strftime("%Y-%m-%d")
+        log.warning("설명 시트에 기준일이 없어 파일 수정일(%s)을 기준일로 씀", asof)
+    try:
+        cands, dropped = rules.select_candidates(df, cfg, return_dropped=True)
+    except ValueError as e:
+        log.error("후보 선정 실패: %s", e)
+        return None
+    listed = set()
+    if df is not None and len(df) and rules.COL_TICKER in df.columns:
+        listed = {str(t).strip().upper() for t in df[rules.COL_TICKER] if not rules._is_blank(t)}
+    return {"df": df, "asof": asof, "cands": cands, "dropped": dropped, "listed": listed}
+
+
+def _broker_now(broker):
+    return broker._now() if hasattr(broker, "_now") else now_kst()
+
+
+def regular_window(broker, now):
+    """(현재 세션명, 정규장 시작, 정규장 종료). 달력을 못 읽으면 시작/종료는 None."""
+    try:
+        sess = broker.session_now()
+    except Exception as e:
+        log.warning("세션 조회 실패: %s", e)
+        sess = None
+    s = e = None
+    try:
+        if hasattr(broker, "_session_and_day"):
+            _, day = broker._session_and_day(now)
+            win = (day or {}).get("regularMarket") or {}
+            s, e = parse_ts(win.get("startTime")), parse_ts(win.get("endTime"))
+        elif hasattr(broker, "regular_bounds"):
+            b = broker.regular_bounds(now)
+            if b:
+                s, e = b[0], b[1]
+    except Exception as ex:
+        log.warning("정규장 시간 조회 실패: %s", ex)
+    return sess, s, e
+
+
+def entry_gate(cfg, broker, args, is_live):
+    """정규장 시작 + entry_offset_min 부터 정규장 종료 1시간 전까지만 주문한다 (금액주문 가능 구간).
+    크론을 23:15 와 00:15 두 번 걸어도 서머타임/겨울 중 맞는 쪽만 통과한다. (ok, 사유)"""
+    if getattr(args, "ignore_hours", False):
+        if is_live:
+            raise PermissionError("--ignore-hours 는 paper 전용 (실계좌에서는 진입 시각 검사를 끌 수 없음)")
+        log.warning("--ignore-hours: 진입 시각 검사 생략 (paper 샌드박스 전용)")
+        return True, None
+    now = _broker_now(broker)
+    sess, s, e = regular_window(broker, now)
+    off = int((cfg.get("schedule") or {}).get("entry_offset_min", 45))
+    if sess != "regularMarket" or s is None or e is None:
+        return False, f"정규장 아님 (현재 세션 {sess or '장외'})"
+    t0 = s + timedelta(minutes=off)
+    if now < t0:
+        return False, f"아직 진입 시각 전 (정규장 {s:%H:%M} + {off}분 = {t0:%H:%M} KST 부터)"
+    if now > e - timedelta(hours=1):
+        return False, f"정규장 마감 1시간 전({e - timedelta(hours=1):%H:%M}) 이후 — 금액주문 불가 구간"
+    return True, None
+
+
+def es_load(broker):
+    es = broker_meta_get(broker, "exit_state") or {}
+    return {str(k).upper(): dict(v) for k, v in es.items()} if isinstance(es, dict) else {}
+
+
+def es_save(broker, es):
+    broker_meta_set(broker, exit_state=es)
+
+
+def watch_exits(cfg, broker, where, listed=None, asof=None, quotes=None):
+    """최고가 갱신 + 추적손절 판정 (+ listed 가 오면 게이트 탈락 주수). 주문은 내지 않는다.
+    게이트 탈락 주수는 기준일(asof)당 한 번만 센다 (같은 기준일 재실행·이중 발화로 두 번 세지 않게)."""
+    ex = strategy.exit_cfg(cfg)
+    holdings = broker.holdings()
+    es = strategy.sync_exit_state(es_load(broker), holdings)
+    if not ex["enabled"] or not holdings:
+        es_save(broker, es)
+        return es, []
+    if quotes is None:
+        quotes = fetch_quotes(broker, list(holdings))
+    ts = fmt_ts(_broker_now(broker))
+    strategy.mark_high_water(es, quotes)
+    hits = strategy.check_trailing(es, quotes, ex["trailing_stop_pct"], ts)
+    if listed is not None and asof and broker_meta_get(broker, "gate_checked_asof") != asof:
+        hits += strategy.update_gate_absence(es, listed, ex["gate_absent_weeks"], ts)
+        broker_meta_set(broker, gate_checked_asof=asof)
+    for sym in hits:
+        log.info("  [%s] 매도 대기 표시 %-6s %s", where, sym, es[sym]["pending_exit"]["reason"])
+    es_save(broker, es)
+    return es, hits
+
+
+def _report_result(res, sym, verb, reason):
+    """주문 결과 한 줄 로그. 반환 FILLED / PENDING / REJECTED."""
+    st = str((res or {}).get("status", "OPEN")).upper()
+    if st == "REJECTED":
+        code = res.get("code") or res.get("reason")
+        text = res.get("reason") if "code" in res else res.get("message")
+        log.info("  거절 %s %-6s %s: %s", verb, sym, code, text)
+        return "REJECTED"
+    if st == "FILLED":
+        f = res.get("fill") or {}
+        log.info("  체결 %s %-6s %s주 @%.4f 금액 $%.2f 수수료 $%.2f — %s", verb, sym, f.get("qty"),
+                 f.get("fillPrice") or 0, f.get("grossValue") or 0, f.get("commission") or 0, reason)
+        return "FILLED"
+    log.info("  접수 %s %-6s %s (id %s) — %s", verb, sym, st, res.get("orderId") or res.get("order_id"), reason)
+    return "PENDING"
+
+
+def _sell(broker, sym, qty, cid):
+    try:
+        return broker.place_order(symbol=sym, side="SELL", order_type="MARKET", quantity=qty,
+                                  client_order_id=cid) or {}
+    except Exception as e:
+        return {"status": "REJECTED", "code": "exception", "reason": str(e)}
+
+
+def execute_exits(broker, es, is_live, tag):
+    """pending_exit 종목 전량 시장가 매도. (판 종목 set, 결과 카운트)."""
+    holdings = broker.holdings()
+    try:
+        open_sells = {str(o.get("symbol", "")).upper() for o in (broker.open_orders() or [])
+                      if str(o.get("side", "")).upper() == "SELL"}
+    except Exception:
+        open_sells = set()
+    sold, n = set(), {"FILLED": 0, "PENDING": 0, "REJECTED": 0}
+    for i, sym in enumerate(strategy.pending_exits(es, holdings)):
+        reason = es[sym]["pending_exit"]["reason"]
+        if sym in open_sells:
+            log.info("  매도 대기 %-6s 이미 매도 주문 접수됨 → 건너뜀", sym)
+            sold.add(sym)
+            continue
+        if i and is_live:
+            time.sleep(0.2)
+        qty = strategy.floor6(float(holdings[sym]["qty"]))
+        res = _sell(broker, sym, qty, strategy.client_id(f"ax-{tag}", sym))
+        st = _report_result(res, sym, "매도", reason)
+        n[st] += 1
+        if st != "REJECTED":
+            sold.add(sym)
+        if st == "FILLED":
+            es.pop(sym, None)
+    es_save(broker, es)
+    return sold, n
+
+
+def build_plan_v2(cfg, broker, ctx, exclude=()):
+    holdings = broker.holdings()
+    try:
+        open_orders = broker.open_orders()
+    except Exception as e:
+        log.warning("미체결 조회 실패(없는 것으로 계산): %s", e)
+        open_orders = []
+    quotes = fetch_quotes(broker, list(holdings) + [c["symbol"] for c in ctx["cands"]])
+    cash = float(broker.buying_power("USD"))
+    trims = strategy.plan_trims(ctx["cands"], holdings, quotes, cash, cfg, ctx["asof"], exclude=exclude)
+    plan = strategy.plan_buys(ctx["cands"], holdings, quotes, cash, cfg, ctx["asof"],
+                              open_orders=open_orders, exclude=exclude)
+    session = None
+    try:
+        session = broker.session_now()
+    except Exception as e:
+        log.warning("세션 조회 실패: %s", e)
+    return {"asof": ctx["asof"], "candidates": ctx["cands"], "dropped": ctx["dropped"],
+            "holdings": holdings, "open_orders": open_orders, "quotes": quotes, "cash_usd": cash,
+            "plan": plan, "trims": trims, "session": session, "ts": fmt_ts(now_kst())}
+
+
+def print_plan_v2(cfg, info, es):
+    plan = info["plan"]
+    log.info("규칙: %s", rule_label(cfg))
+    log.info("총자산 $%.2f = 현금 $%.2f + 보유 %d종목 $%.2f | 목록 %d종, 목표비중 합 %.1f%% | 신규 배정 비율 %.1f%%",
+             plan.equity, info["cash_usd"], len(info["holdings"]), sum(plan.values.values()),
+             len(info["candidates"]), sum(plan.weights.values()) * 100, plan.scale * 100)
+    for s_, st in sorted((es or {}).items()):
+        if st.get("pending_exit"):
+            log.info("  매도 대기 %-6s %s", s_, st["pending_exit"]["reason"])
+    for o in info.get("trims") or []:
+        log.info("  비중매도 %-6s %.6f주 ≈$%.2f  %s", o["symbol"], o["quantity"], o["est_usd"], o["reason"])
+    print_plan(cfg, info)
+    new = [o for o in plan if o.get("kind") == "new"]
+    top = [o for o in plan if o.get("kind") == "topup"]
+    log.info("매수 합계: 신규 %d건 $%.2f / 추가매수 %d건 $%.2f", len(new), sum(o["est_usd"] for o in new),
+             len(top), sum(o["est_usd"] for o in top))
+
+
+def cmd_plan_v2(cfg, args, inj):
+    broker, is_live = make_broker(cfg, args, inj)
+    ctx = load_context(cfg)
+    if ctx is None:
+        return 1
+    holdings = broker.holdings()
+    es = strategy.sync_exit_state(es_load(broker), holdings)          # 보기만 (저장 안 함)
+    pend = strategy.pending_exits(es, holdings)
+    info = build_plan_v2(cfg, broker, ctx, exclude=set(pend))
+    print_plan_v2(cfg, info, es)
+    if pend:
+        log.info("※ 매도 대기 %d종목은 run 때 먼저 팔고, 그 현금으로 매수를 다시 계산합니다", len(pend))
+    log.info("계획 저장: %s", write_last_plan(cfg, info))
+    return 0
+
+
+def cmd_run_v2(cfg, args, inj):
+    broker, is_live = make_broker(cfg, args, inj)
+    tag = "LIVE 실계좌" if is_live else "PAPER 모의"
+    log.info("===== run v2 [%s] %s =====", tag, fmt_ts(now_kst()))
+    ctx = load_context(cfg)
+    if ctx is None:
+        return 1
+    asof = ctx["asof"]
+    if not ctx["cands"]:
+        log.warning("후보 0개 (워치리스트가 비었거나 전부 제외) → 아무것도 안 함, 기준일 기록 안 함")
+        return 1
+    if broker_meta_get(broker, "last_run_asof") == asof and not getattr(args, "force", False):
+        log.info("[SKIP] 이미 이번 기준일(%s) 실행됨. 손절 청산은 exits 가 한다. 다시 하려면 --force", asof)
+        return 3
+    ok, why = entry_gate(cfg, broker, args, is_live)
+    if not ok:
+        log.info("[SKIP] %s → 아무것도 안 함", why)
+        return 3
+    log.info("규칙: %s | 기준일 %s", rule_label(cfg), asof)
+    if is_live:
+        log.warning("!!! 실계좌 주문 시작 — 실제 돈이 움직입니다 !!!")
+
+    # ① 매도 조건 갱신 (최고가·추적손절·게이트탈락 주수) → ② 매도 대기 전량 청산
+    holdings = broker.holdings()
+    quotes = fetch_quotes(broker, list(holdings) + [c["symbol"] for c in ctx["cands"]])
+    es, _ = watch_exits(cfg, broker, "run", listed=ctx["listed"], asof=asof, quotes=quotes)
+    sold, n_exit = execute_exits(broker, es, is_live, asof)
+
+    # ③ 비중초과 매도 (mode C) → 판 현금으로 다시 계산
+    info = build_plan_v2(cfg, broker, ctx, exclude=sold)
+    n_trim = {"FILLED": 0, "PENDING": 0, "REJECTED": 0}
+    if info["trims"]:
+        for o in info["trims"]:
+            n_trim[_report_result(_sell(broker, o["symbol"], o["quantity"], o["client_order_id"]),
+                                  o["symbol"], "비중매도", o["reason"])] += 1
+        info = build_plan_v2(cfg, broker, ctx, exclude=sold)
+
+    # ④ 매수 (신규 → 추가매수)
+    print_plan_v2(cfg, info, es_load(broker))
+    write_last_plan(cfg, info)
+    plan = info["plan"]
+    no_quote = [s_["symbol"] for s_ in plan.skipped
+                if str(s_.get("reason", "")).startswith(rules.REASON_NO_QUOTE)]
+    n_buy = {"FILLED": 0, "PENDING": 0, "REJECTED": 0}
+    for i, o in enumerate(plan):
+        if i and is_live:
+            time.sleep(0.2)
+        try:
+            res = _place(broker, o)
+        except Exception as e:
+            res = {"status": "REJECTED", "code": "exception", "reason": str(e)}
+        verb = "신규매수" if o.get("kind") == "new" else "추가매수"
+        n_buy[_report_result(res or {}, o["symbol"], verb, o["reason"])] += 1
+
+    es_save(broker, strategy.sync_exit_state(es_load(broker), broker.holdings()))   # 새 보유 → 최고가 시작값
+    if hasattr(broker, "tick"):
+        broker.tick()
+    filled = n_exit["FILLED"] + n_trim["FILLED"] + n_buy["FILLED"]
+    pending = n_exit["PENDING"] + n_trim["PENDING"] + n_buy["PENDING"]
+    attempted = sum(n_exit.values()) + sum(n_trim.values()) + sum(n_buy.values())
+    log.info("완료: 매도 %s / 비중매도 %s / 매수 %s", n_exit, n_trim, n_buy)
+    if no_quote:
+        log.warning("시세가 없어 이번에 빠진 후보: %s", no_quote)
+    if filled or (is_live and pending) or (attempted == 0 and not no_quote):
+        broker_meta_set(broker, last_run_asof=asof, last_run_ts=fmt_ts(now_kst()))
+        log.info("기준일 %s 실행 완료로 기록", asof)
+        rc = 0
+    else:
+        log.warning("체결 0건 → 기준일 기록 안 함 (다음 발화에서 다시 시도)")
+        rc = 1
+    _print_summary(broker, cfg)
+    return rc
+
+
+def cmd_exits(cfg, args, inj):
+    """화~금: 매도 대기(추적손절·게이트탈락) 종목만 정규장 진입 시각에 청산. 매수는 안 한다."""
+    if not is_v2(cfg):
+        log.info("exits 는 v2(sizing.method=score_weight) 전용 → 할 일 없음")
+        return 0
+    broker, is_live = make_broker(cfg, args, inj)
+    if not broker.holdings():
+        log.info("보유 종목 없음 → 할 일 없음")
+        return 0
+    ok, why = entry_gate(cfg, broker, args, is_live)
+    if not ok:
+        log.info("[SKIP] %s → 아무것도 안 함", why)
+        return 3
+    es, _ = watch_exits(cfg, broker, "exits")
+    if not strategy.pending_exits(es, broker.holdings()):
+        log.info("매도 대기 종목 없음")
+        return 0
+    if is_live:
+        log.warning("!!! 실계좌 매도 주문 — 실제 돈이 움직입니다 !!!")
+    _sold, n = execute_exits(broker, es, is_live, _broker_now(broker).strftime("%Y%m%d"))
+    if hasattr(broker, "tick"):
+        broker.tick()
+    log.info("exits 완료: %s", n)
+    _print_summary(broker, cfg)
+    return 0 if n["REJECTED"] == 0 else 1
+
+
+def add_v2_columns(cfg, pos_df, broker):
+    """리포트 보유 시트에 목표비중 / 보유비중 / 최고가 / 손절가 / 탈락주수 / 매도대기 추가."""
+    import pandas as pd
+    ctx = load_context(cfg)
+    es = es_load(broker)
+    pct = strategy.exit_cfg(cfg)["trailing_stop_pct"]
+    eq = broker.summary()["equity_usd"] or 0.0
+    w = strategy.target_weights(ctx["cands"]) if ctx else {}
+    cols = ["목표비중%", "보유비중%", "최고가", "손절가", "탈락주수", "매도대기"]
+    rows = []
+    for _, r in pos_df.iterrows():
+        sym = str(r["티커"]).upper()
+        st = es.get(sym, {})
+        sp = strategy.stop_price(st, pct)
+        rows.append([round(w[sym] * 100, 2) if sym in w else "목록 밖",
+                     round(float(r["평가금액"]) / eq * 100, 2) if eq else None,
+                     round(st["high_water"], 4) if st.get("high_water") else None,
+                     round(sp, 4) if sp else None, st.get("absent_weeks", 0),
+                     (st.get("pending_exit") or {}).get("reason", "")])
+    return pd.concat([pos_df, pd.DataFrame(rows, index=pos_df.index, columns=cols)], axis=1)
+
+
+COMMANDS = {"plan": cmd_plan, "run": cmd_run, "exits": cmd_exits, "tick": cmd_tick, "status": cmd_status,
             "report": cmd_report, "replay": cmd_replay, "reset": cmd_reset, "config": cmd_config}
 
 
@@ -762,6 +1175,7 @@ def menu(cfg_path, inj):
         print()
         print("=" * 56)
         print(f"  auto_buy  {label}   설정: {cfg_path}")
+        print(f"  규칙: {rule_label(cfg)}")
         print("=" * 56)
         print("  1. plan    이번 주 주문 계획 보기 (상태 변경 없음)")
         print("  2. run     주문 실행 (페이퍼 / live 는 플래그·환경변수 필요)")
@@ -771,13 +1185,14 @@ def menu(cfg_path, inj):
         print("  6. replay  과거 시뮬레이션 (replay.py)")
         print("  7. reset   페이퍼 상태 초기화")
         print("  8. config  설정 보기")
+        print("  9. exits   매도 대기 종목만 청산 (추적손절·게이트탈락)")
         print("  0. 종료")
         try:
             sel = input("번호 선택: ").strip()
         except EOFError:
             return 0
         argv_map = {"1": ["plan"], "2": ["run"], "3": ["tick"], "4": ["status"], "5": ["report"],
-                    "6": ["replay"], "7": ["reset"], "8": ["config"]}
+                    "6": ["replay"], "7": ["reset"], "8": ["config"], "9": ["exits"]}
         if sel == "0" or sel == "":
             return 0
         if sel not in argv_map:
@@ -794,6 +1209,8 @@ def menu(cfg_path, inj):
                 sub += ["--end", e]
             if c:
                 sub += ["--cadence", c]
+            if input("v1/v2-A/B/C 비교? [y/N] ").strip().lower() == "y":
+                sub += ["--compare"]
         rc = main(sub + ["--config", cfg_path], **inj)
         print(f"(exit {rc})")
 
@@ -811,6 +1228,10 @@ def build_parser():
     r = sp.add_parser("run", parents=[common], help="주문 실행")
     r.add_argument("--live", action="store_true", help="실계좌 (config mode=live + AUTO_BUY_LIVE_OK=1 필요)")
     r.add_argument("--force", action="store_true", help="같은 기준일 재실행 허용")
+    r.add_argument("--ignore-hours", action="store_true", help="진입 시각 검사 생략 (paper 샌드박스 전용)")
+    ex = sp.add_parser("exits", parents=[common], help="매도 대기(추적손절·게이트탈락) 종목만 청산 (화~금)")
+    ex.add_argument("--live", action="store_true", help="실계좌 (config mode=live + AUTO_BUY_LIVE_OK=1 필요)")
+    ex.add_argument("--ignore-hours", action="store_true", help="진입 시각 검사 생략 (paper 샌드박스 전용)")
     for name in ("tick", "status"):
         x = sp.add_parser(name, parents=[common])
         x.add_argument("--live", action="store_true", help="실계좌 조회 (config mode=live 필요)")
@@ -822,6 +1243,7 @@ def build_parser():
     rr.add_argument("--cadence", default=None, choices=["weekly", "monthly"])
     rr.add_argument("--refresh", action="store_true", help="스크리닝 캐시 무시하고 다시 계산")
     rr.add_argument("--out", default=None, help="결과 엑셀 경로 (기본 paper_replay_latest.xlsx)")
+    rr.add_argument("--compare", action="store_true", help="v1균등 / v2-A / v2-B / v2-C 비교")
     rs = sp.add_parser("reset", parents=[common], help="페이퍼 상태 초기화")
     rs.add_argument("--yes", action="store_true")
     sp.add_parser("config", parents=[common], help="설정 출력")

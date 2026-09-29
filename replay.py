@@ -51,6 +51,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE_DIR)
 
 import rules                                          # noqa: E402
+import strategy                                  # noqa: E402  (v2 규칙)
 from broker_paper import PaperBroker, KST             # noqa: E402
 
 CACHE_DIR = os.path.join(BASE_DIR, "paper", "replay_cache")
@@ -564,12 +565,14 @@ def simulate(dates, trading_days, screen_fn, panel, cfg, state_path, end=None, p
     screen_fn(asof) → {'watchlist': DataFrame(한글 열), 'universe': [CODE...]} (+ 'cached', 'elapsed' 선택)
     panel: {'OPEN': wide, 'CLOSE': wide}. cfg: auto_buy_config 전체 dict.
     반환 dict: broker, trades(list), rebal_rows, rebal_summary, equity(DataFrame), bench, cash_out_date, ..."""
+    if strategy.is_v2(cfg):
+        return simulate_v2(dates, trading_days, screen_fn, panel, cfg, state_path, end=end, progress=progress)
     trading_days = list(trading_days)
     end = end or trading_days[-1]
     if os.path.exists(state_path):
         os.remove(state_path)
     mkt = ReplayMarket(panel)
-    paper_cfg = dict(cfg.get("paper") or {})
+    paper_cfg = replay_paper_cfg(cfg)
     broker = PaperBroker(state_path, mkt.quote, mkt.session_fn, paper_cfg,
                          calendar_fn=None, now_fn=mkt.now_fn, fx_fn=None)
     exit_cfg = cfg.get("exit") or {}
@@ -792,6 +795,9 @@ def build_summary(res, cfg, cadence, split_events=None):
         ("기간(체결 시작~평가 종료)", f"{res.get('first_fill') or '-'} ~ {res['end']}"),
         ("리밸런스 구간", f"{dates[0]} ~ {dates[-1]}" if dates else "-"),
         ("주기", cadence),
+        ("규칙", res.get("rule_label") or strategy.rule_label(cfg)),
+        ("매도 사유별 건수(추적손절/게이트탈락/비중초과)", "{stop} / {gate} / {trim}".format(**res["counters"])
+         if res.get("counters") else "-"),
         ("리밸런스 횟수", len(res["rebal_summary"])),
         ("스크리닝(기준일) 수 / 캐시 사용", f"{res['n_screens']} / {res['n_cached']}"),
         ("초기자산(USD)", round(initial, 2)),
@@ -892,6 +898,375 @@ def write_report(res, cfg, out, cadence, split_events=None):
 
 
 # ── 진입점 ───────────────────────────────────────────────────────────────
+# ── v2 규칙 시뮬레이션 (strategy.py — auto_buy 와 같은 함수) ─────────────────
+# 리밸런스일(월): 기준일 = 직전 금요일, 체결일 = 그 주 첫 거래일 시가.
+#   ① 게이트 탈락 주수 갱신 → 매도 대기 전량 시가 매도
+#   ② (mode C) 비중초과 매도  ③ 신규(점수 비중) → 추가매수(B/C) 시가 매수
+# 매일: 종가로 최고가 갱신·추적손절 판정 → 걸리면 다음 거래일 시가에 매도
+def replay_paper_cfg(cfg):
+    """paper 설정 사본. convert_at_start 면 KRW 를 paper.fx_rate×(1+장중 스프레드) 로 USD 전환해 시작."""
+    p = dict(cfg.get("paper") or {})
+    krw = float(p.get("initial_cash_krw") or 0.0)
+    if p.get("convert_at_start") and krw > 0:
+        rate = float(p.get("fx_rate") or 1357.2)
+        spread = float(p.get("fx_spread_pct_market", 0.05))
+        p["initial_cash_usd"] = float(p.get("initial_cash_usd") or 0.0) + strategy.floor2(
+            krw / (rate * (1 + spread / 100.0)))
+        p["initial_cash_krw"] = 0.0
+    return p
+
+
+def simulate_v2(dates, trading_days, screen_fn, panel, cfg, state_path, end=None, progress=True):
+    trading_days = list(trading_days)
+    end = end or trading_days[-1]
+    if os.path.exists(state_path):
+        os.remove(state_path)
+    mkt = ReplayMarket(panel)
+    paper_cfg = replay_paper_cfg(cfg)
+    broker = PaperBroker(state_path, mkt.quote, mkt.session_fn, paper_cfg,
+                         calendar_fn=None, now_fn=mkt.now_fn, fx_fn=None)
+    ex = strategy.exit_cfg(cfg)
+    exit_on, pct, weeks = ex["enabled"], ex["trailing_stop_pct"], ex["gate_absent_weeks"]
+    es = {}
+    names = {}
+    counters = {"stop": 0, "gate": 0, "trim": 0}
+    trades, rebal_rows, rebal_summary, flows = [], [], [], []
+    cash_out_date = None
+    bench_universe, bench_start = None, None
+    marked_through = None
+    n = len(dates)
+    n_screens = n_cached = 0
+
+    def quotes_at(D, field, syms):
+        mkt.set(D, field)
+        return {k: v for k, v in mkt.quotes(list(syms)).items() if v}
+
+    def sell_pending(D, rd="", asof=""):
+        """D 시가에 매도 대기 전량 매도 → {sym: (사유, 체결금액)}."""
+        mkt.set(D, "OPEN")
+        h = broker.holdings()
+        out = {}
+        for sym in strategy.pending_exits(es, h):
+            reason = es[sym]["pending_exit"]["reason"]
+            res = broker.place_order(symbol=sym, side="SELL", order_type="MARKET",
+                                     quantity=strategy.floor6(float(h[sym]["qty"])),
+                                     client_order_id=strategy.client_id(f"rx-{D}", sym))
+            if str(res.get("status")) == "FILLED":
+                trades.append(_fill_row(res, {"rd": rd or D, "asof": asof, "fill_date": D,
+                                              "name": names.get(sym, ""), "note": reason}))
+                counters["gate" if reason.startswith(strategy.REASON_GATE) else "stop"] += 1
+                out[sym] = (reason, float(res["fill"]["grossValue"]))
+                es.pop(sym, None)
+            else:
+                log.info("  매도 거절 %-6s %s: %s", sym, res.get("code"), res.get("reason"))
+        return out
+
+    def run_days(after, until):
+        """after < D <= until: (대기 매도가 있으면 D 시가 매도) → D 종가 평가 → 최고가·추적손절 판정."""
+        lo = bisect.bisect_right(trading_days, after) if after else 0
+        hi = bisect.bisect_right(trading_days, until)
+        for D in trading_days[lo:hi]:
+            if exit_on and any(st.get("pending_exit") for st in es.values()):
+                sold = sell_pending(D)
+                cash_in = sum(v[1] for v in sold.values())
+                if cash_in:
+                    flows.append((D, -cash_in))
+            mkt.set(D, "CLOSE")
+            broker.tick()
+            if exit_on:
+                h = broker.holdings()
+                strategy.sync_exit_state(es, h)
+                q = quotes_at(D, "CLOSE", h)
+                strategy.mark_high_water(es, q)
+                strategy.check_trailing(es, q, pct, D)
+
+    for i, rd in enumerate(dates):
+        asof = pick_asof(rd, trading_days)
+        fill_date = next_trading_day(rd, trading_days)
+        if asof is None:
+            log.info("[%d/%d] %s: 기준일을 잡을 거래일이 없음 → 건너뜀", i + 1, n, rd)
+            continue
+        if fill_date is None or fill_date > end:
+            log.info("[%d/%d] %s: 체결할 거래일이 데이터 끝(%s) 이후 → 종료", i + 1, n, rd, end)
+            break
+        t0 = time.time()
+        scr = screen_fn(asof)
+        n_screens += 1
+        n_cached += 1 if scr.get("cached") else 0
+        wl = scr.get("watchlist")
+        wl = wl if wl is not None else empty_watchlist()
+        if bench_universe is None:
+            uni = scr.get("universe")
+            if isinstance(uni, pd.DataFrame):
+                uni = uni["CODE"].tolist() if "CODE" in uni.columns else []
+            bench_universe = [str(c).upper() for c in (uni if uni is not None else [])]
+            bench_start = fill_date
+        if marked_through is not None:
+            run_days(marked_through, _prev_day(fill_date))
+
+        cands, dropped = rules.select_candidates(wl, cfg, return_dropped=True)
+        listed = set()
+        if len(wl) and "티커" in wl.columns:
+            for _, r in wl.iterrows():
+                sym = str(r["티커"]).upper()
+                listed.add(sym)
+                names[sym] = r.get("종목명", "")
+        outcome = {}
+        n_sell, sell_usd = 0, 0.0
+
+        # ① 게이트 탈락 주수 → 매도 대기 전량 시가 매도
+        sold = {}
+        if exit_on:
+            strategy.sync_exit_state(es, broker.holdings())
+            strategy.update_gate_absence(es, listed, weeks, rd)
+            sold = sell_pending(fill_date, rd, asof)
+            for sym, (reason, gross) in sold.items():
+                outcome[sym] = f"매도 ${gross:,.2f}: {reason}"
+                n_sell += 1
+                sell_usd += gross
+
+        # ② 비중초과 매도 (mode C)
+        h = broker.holdings()
+        q = quotes_at(fill_date, "OPEN", list(h) + [c["symbol"] for c in cands])
+        for o in strategy.plan_trims(cands, h, q, float(broker.buying_power("USD")), cfg, asof, exclude=set(sold)):
+            res = broker.place_order(symbol=o["symbol"], side="SELL", order_type="MARKET",
+                                     quantity=o["quantity"], client_order_id=o["client_order_id"])
+            if str(res.get("status")) == "FILLED":
+                trades.append(_fill_row(res, {"rd": rd, "asof": asof, "fill_date": fill_date,
+                                              "name": o.get("name", ""), "note": o["reason"]}))
+                counters["trim"] += 1
+                n_sell += 1
+                sell_usd += float(res["fill"]["grossValue"])
+                outcome[o["symbol"]] = f"비중매도 ${res['fill']['grossValue']:,.2f}"
+
+        # ③ 신규 → 추가매수
+        plan = strategy.plan_buys(cands, broker.holdings(), q, float(broker.buying_power("USD")), cfg, asof,
+                                  open_orders=broker.open_orders(), exclude=set(sold))
+        for d in dropped:
+            outcome.setdefault(d["symbol"], f"제외: {d['reason']}")
+        for s_ in plan.skipped:
+            outcome.setdefault(s_["symbol"], f"건너뜀: {s_['reason']}")
+        if cash_out_date is None and i > 0 and any(o.get("kind") == "new" for o in plan) and plan.scale < 0.5:
+            cash_out_date = rd        # 신규 종목이 목표의 절반도 못 받은 첫 리밸런스
+        n_buy, buy_usd = 0, 0.0
+        for o in plan:
+            res = _place(broker, o)
+            if str(res.get("status")) == "FILLED":
+                f = res["fill"]
+                trades.append(_fill_row(res, {"rd": rd, "asof": asof, "fill_date": fill_date,
+                                              "name": o.get("name", ""), "note": o.get("reason", "")}))
+                n_buy += 1
+                buy_usd += float(f["grossValue"])
+                kind = "신규" if o.get("kind") == "new" else "추가"
+                outcome[o["symbol"]] = f"{kind}매수 ${f['grossValue']:,.2f} (목표비중 {o['target_weight'] * 100:.2f}%)"
+            else:
+                outcome[o["symbol"]] = f"거절: {res.get('code')} {res.get('reason')}"
+        if buy_usd or sell_usd:
+            flows.append((fill_date, buy_usd - sell_usd))
+        if exit_on:
+            strategy.sync_exit_state(es, broker.holdings())
+
+        run_days(_prev_day(fill_date), fill_date)            # 체결일 종가 평가 + 추적손절 판정
+        marked_through = fill_date
+        snap = broker.state["equity_history"][-1] if broker.state["equity_history"] else {}
+        eq = float(snap.get("equity_usd") or 0.0)
+
+        w = plan.weights
+        for j, r in (wl.iterrows() if len(wl) else []):
+            sym = str(r.get("티커", "")).upper()
+            rebal_rows.append({"리밸런스일": rd, "기준일": asof, "체결일": fill_date, "순위": r.get("순위", j + 1),
+                               "티커": sym, "종목명": r.get("종목명", ""), "섹터": r.get("섹터", ""),
+                               "유형": r.get("유형", ""), "주의": r.get("주의", ""),
+                               "주도주점수": r.get("주도주점수"), "상대강도(0~100)": r.get("상대강도(0~100)"),
+                               "52주고점대비%": r.get("52주고점대비%"), "시총(십억$)": r.get("시총(십억$)"),
+                               "목표비중%": round(w[sym] * 100, 2) if sym in w else None,
+                               "결과": outcome.get(sym, "")})
+        for sym, txt in outcome.items():                     # 목록 밖 보유 종목 매도 결과도 남긴다
+            if sym not in listed:
+                rebal_rows.append({"리밸런스일": rd, "기준일": asof, "체결일": fill_date, "티커": sym,
+                                   "종목명": names.get(sym, ""), "결과": txt})
+        rebal_summary.append({"리밸런스일": rd, "기준일": asof, "체결일": fill_date,
+                              "목록수": len(wl), "후보수": len(cands), "매수건수": n_buy, "매도건수": n_sell,
+                              "매수금액": round(buy_usd, 2), "현금(체결후)": round(broker.state["cash"]["USD"], 2),
+                              "보유종목수": len(broker.holdings()), "총자산(체결일종가)": round(eq, 2),
+                              "스크리닝": "캐시" if scr.get("cached") else f"계산 {scr.get('elapsed', 0)}s"})
+        if progress:
+            log.info("[%d/%d] %s 기준일 %s 체결 %s | 목록 %d 매수 %d 매도 %d | 보유 %d 현금 $%s 총자산 $%s | %s (%.1fs)",
+                     i + 1, n, rd, asof, fill_date, len(wl), n_buy, n_sell, len(broker.holdings()),
+                     f"{broker.state['cash']['USD']:,.0f}", f"{eq:,.0f}",
+                     "캐시" if scr.get("cached") else f"스크리닝 {scr.get('elapsed', 0)}s", time.time() - t0)
+
+    if marked_through is not None:
+        run_days(marked_through, end)
+
+    equity = pd.DataFrame(broker.state["equity_history"],
+                          columns=["ts", "equity_usd", "cash_usd", "cash_krw", "positions_value"])
+    if len(equity):
+        equity["거래일"] = equity["ts"].str[:10]
+        peak = equity["equity_usd"].cummax()
+        equity["drawdown_pct"] = ((equity["equity_usd"] / peak - 1) * 100).round(3)
+    bench = {"curve": pd.Series(dtype=float), "final": pd.Series(dtype=float), "n": 0,
+             "start": bench_start, "end": end, "ew_return_pct": None, "median_return_pct": None,
+             "schedule_curve": pd.Series(dtype=float), "schedule_return_pct": None,
+             "schedule_invested": 0.0, "flows": flows}
+    if bench_universe and bench_start:
+        curve, final, nb = benchmark_curve(panel, bench_universe, bench_start, end)
+        bench.update({"curve": curve, "final": final, "n": nb})
+        if len(curve):
+            bench["ew_return_pct"] = (float(curve.iloc[-1]) - 1) * 100
+            bench["median_return_pct"] = (float(final.median()) - 1) * 100
+        initial = float(paper_cfg.get("initial_cash_usd", 10000))
+        days = equity["거래일"].tolist() if len(equity) else []
+        sc, invested, _ = schedule_benchmark_curve(panel, bench_universe, flows, initial, days)
+        bench.update({"schedule_curve": sc, "schedule_invested": invested})
+        if len(sc) and initial:
+            bench["schedule_return_pct"] = (float(sc.iloc[-1]) / initial - 1) * 100
+    return {"broker": broker, "trades": trades, "rebal_rows": rebal_rows, "rebal_summary": rebal_summary,
+            "equity": equity, "bench": bench, "cash_out_date": cash_out_date,
+            "n_screens": n_screens, "n_cached": n_cached, "dates": dates, "end": end,
+            "first_fill": bench_start, "counters": counters, "rule_label": strategy.rule_label(cfg)}
+
+
+# ── 규칙 비교 (같은 스크리닝·같은 가격으로 4개 설정) ─────────────────────────
+VARIANTS = [("v1_equal", "v1 균등(상위5·종목당$1000·매도없음)"), ("v2_A", "v2-A 보유유지"),
+            ("v2_B", "v2-B 추가매수만"), ("v2_C", "v2-C 양방향")]
+
+
+def variant_configs(cfg):
+    import copy
+    out = {}
+    for key, _label in VARIANTS:
+        c = copy.deepcopy(cfg)
+        c.setdefault("sizing", {})
+        c.setdefault("source", {})
+        c.setdefault("exit", {})
+        c.setdefault("rebalance", {})
+        if key == "v1_equal":
+            c["sizing"].update({"method": "equal", "per_stock_usd": 1000, "weekly_cap_usd": 3000,
+                                "max_positions": 10, "skip_if_held": True, "min_order_usd": 50})
+            c["source"].update({"top_n": 5, "exclude_if_주의": True})
+            c["exit"]["enabled"] = False
+        else:
+            c["sizing"]["method"] = "score_weight"
+            c["rebalance"]["mode"] = key[-1]
+        out[key] = c
+    return out
+
+
+def compare_row(key, label, res):
+    s = res["broker"].summary()
+    eq = res["equity"]
+    initial, final = float(s["initial_equity_usd"]), float(s["equity_usd"])
+    rets = eq["equity_usd"].pct_change().dropna() if len(eq) else pd.Series(dtype=float)
+    vol = float(rets.std() * (252 ** 0.5) * 100) if len(rets) > 1 else 0.0
+    tr = pd.DataFrame(res["trades"], columns=["매매", "비고"]) if res["trades"] else pd.DataFrame(columns=["매매", "비고"])
+    sells = tr[tr["매매"] == "SELL"]["비고"].astype(str)
+    avg_eq = float(eq["equity_usd"].mean()) if len(eq) else initial
+    worst = "-"
+    if len(eq):
+        k = int(eq["drawdown_pct"].idxmin())
+        peak_i = int(eq["equity_usd"].iloc[:k + 1].idxmax())
+        worst = f"{eq['거래일'].iloc[peak_i]} → {eq['거래일'].iloc[k]} ({eq['drawdown_pct'].iloc[k]:.1f}%)"
+    rs = res["rebal_summary"]
+    return {
+        "설정": key, "설명": label, "초기자산($)": round(initial, 2), "최종자산($)": round(final, 2),
+        "수익률%": round((final / initial - 1) * 100, 2) if initial else 0.0,
+        "최대낙폭%": round(float(s["max_drawdown_pct"]), 2), "최대낙폭 구간": worst,
+        "연환산변동성%": round(vol, 2),
+        "매수건수": int((tr["매매"] == "BUY").sum()), "매도건수": int(len(sells)),
+        "추적손절 매도": int(sells.str.startswith(strategy.REASON_TRAIL).sum()),
+        "게이트탈락 매도": int((sells.str.startswith(strategy.REASON_GATE) | sells.str.startswith("목록 이탈")).sum()),
+        "비중초과 매도": int(sells.str.startswith(strategy.REASON_TRIM).sum()),
+        "평균보유종목수": round(sum(r["보유종목수"] for r in rs) / len(rs), 1) if rs else 0,
+        "평균현금비중%": round(float((eq["cash_usd"] / eq["equity_usd"]).mean() * 100), 1) if len(eq) else 0,
+        "회전율%": round((float(s["total_bought"]) + float(s["total_sold"])) / 2 / avg_eq * 100, 1) if avg_eq else 0,
+        "누적수수료($)": round(float(s["commissions"]), 2),
+        "최종보유종목수": int(s["positions_count"]),
+    }
+
+
+def compare(start=DEFAULT_START, end=None, cadence="weekly", cfg=None, out=OUT_XLSX,
+            refresh=False, use_cache=True):
+    """v1 균등 / v2-A / v2-B / v2-C 를 같은 스크리닝(캐시)·같은 가격으로 돌려 비교표를 만든다.
+    첫 설정에서 스크리닝을 계산(느림)하고, 나머지는 캐시를 쓴다."""
+    cfg = cfg or _load_cfg()
+    cadence = (cadence or "weekly").lower()
+    start = start or DEFAULT_START
+    latest = db_latest_date()
+    end = min(end, latest) if end else latest
+    dates = rebalance_dates(start, end, cadence)
+    if not dates:
+        raise ValueError(f"{start}~{end} 구간에 리밸런스일(월요일)이 없음")
+    d0 = (pd.Timestamp(start) - pd.Timedelta(days=10)).strftime("%Y-%m-%d")
+    lag_days = int((cfg.get("replay") or {}).get("financial_lag_days", DEFAULT_FIN_LAG_DAYS))
+    log.info("compare %s: %s ~ %s 리밸런스 %d회 × 설정 %d개 | 재무 지연 %d일", cadence, start, end,
+             len(dates), len(VARIANTS), lag_days)
+    panel, split_events = load_prices(d0, end, use_cache=use_cache)
+    trading_days = [d for d in panel["CLOSE"].index if d <= end]
+
+    def screen_fn(asof):
+        return screen_asof(asof, refresh=refresh, use_cache=use_cache, lag_days=lag_days)
+
+    cfgs = variant_configs(cfg)
+    results, rows = {}, []
+    for k, (key, label) in enumerate(VARIANTS):
+        t0 = time.time()
+        sp = os.path.join(BASE_DIR, "paper", f"replay_state_{key}.json")
+        res = simulate(dates, trading_days, screen_fn, panel, cfgs[key], sp, end=end, progress=(k == 0))
+        results[key] = res
+        rows.append(compare_row(key, label, res))
+        log.info("  %s 완료 %.1fs: 수익률 %s%% 최대낙폭 %s%%", key, time.time() - t0,
+                 rows[-1]["수익률%"], rows[-1]["최대낙폭%"])
+    b = results["v2_B"]["bench"]
+    cmp_df = pd.DataFrame(rows)
+    cmp_df["벤치마크 동일가중B&H%"] = round(b["ew_return_pct"], 2) if b.get("ew_return_pct") is not None else None
+    cmp_df["벤치마크 중앙값%"] = round(b["median_return_pct"], 2) if b.get("median_return_pct") is not None else None
+    write_compare_report(cmp_df, results, cfgs, out, cadence, split_events)
+    log.info("compare 완료 → %s", out)
+    return cmp_df
+
+
+def write_compare_report(cmp_df, results, cfgs, out, cadence, split_events=None):
+    main_key = "v2_B"
+    res = results[main_key]
+    summary_df = build_summary(res, cfgs[main_key], cadence, split_events)
+    # 자산추이: 설정별 총자산 + 벤치마크
+    eq = None
+    for key, _ in VARIANTS:
+        e = results[key]["equity"]
+        if not len(e):
+            continue
+        col = e[["거래일", "equity_usd"]].rename(columns={"equity_usd": f"{key} 총자산"})
+        col[f"{key} 낙폭%"] = e["drawdown_pct"].values
+        eq = col if eq is None else eq.merge(col, on="거래일", how="outer")
+    if eq is not None:
+        initial = float(res["broker"].summary()["initial_equity_usd"])
+        curve = res["bench"].get("curve")
+        if curve is not None and len(curve):
+            eq["벤치마크(동일가중B&H)"] = eq["거래일"].map(curve).astype(float).mul(initial).round(2)
+    trade_cols = ["리밸런스일", "기준일", "체결일", "티커", "종목명", "매매", "수량", "체결가", "시가", "체결금액",
+                  "수수료", "실현손익", "주문금액", "주문ID", "비고"]
+    rebal_cols = ["리밸런스일", "기준일", "체결일", "순위", "티커", "종목명", "섹터", "유형", "주의", "주도주점수",
+                  "상대강도(0~100)", "52주고점대비%", "시총(십억$)", "목표비중%", "결과"]
+    rs_cols = ["리밸런스일", "기준일", "체결일", "목록수", "후보수", "매수건수", "매도건수", "매수금액",
+               "현금(체결후)", "보유종목수", "총자산(체결일종가)", "스크리닝"]
+    os.makedirs(os.path.dirname(os.path.abspath(out)) or ".", exist_ok=True)
+    with pd.ExcelWriter(out, engine="openpyxl") as xw:
+        cmp_df.to_excel(xw, sheet_name="비교", index=False)
+        summary_df.to_excel(xw, sheet_name="요약(v2_B)", index=False)
+        (eq if eq is not None else pd.DataFrame()).to_excel(xw, sheet_name="자산추이", index=False)
+        for key, _ in VARIANTS:
+            pd.DataFrame(results[key]["trades"], columns=trade_cols).to_excel(
+                xw, sheet_name=f"거래_{key}", index=False)
+        pd.DataFrame(res["rebal_rows"], columns=rebal_cols).to_excel(xw, sheet_name="리밸런스별목록(v2_B)", index=False)
+        pd.DataFrame(res["rebal_summary"], columns=rs_cols).to_excel(xw, sheet_name="리밸런스요약(v2_B)", index=False)
+        pd.DataFrame(_flatten(cfgs[main_key]), columns=["설정키", "값"]).to_excel(xw, sheet_name="설정", index=False)
+        for ws in xw.book.worksheets:
+            for col in ws.columns:
+                width = max((len(str(c.value)) for c in col if c.value is not None), default=8)
+                ws.column_dimensions[col[0].column_letter].width = min(60, max(10, width + 2))
+
+
 def _load_cfg(path=None):
     from auto_buy import load_config
     cfg, _ = load_config(path)

@@ -685,7 +685,10 @@ class PaperBroker:
         sell_comm = commissions - buy_comm
         bought = sum(f["grossValue"] for f in fills if f["side"] == "BUY")
         sold = sum(f["grossValue"] for f in fills if f["side"] == "SELL")
-        initial = float(self.cfg["initial_cash_usd"]) + float(self.cfg["initial_cash_krw"]) / v["fx_rate"]
+        initial = self.get_meta("initial_equity_usd")   # convert_at_start 로 원화를 전환했으면 그 금액
+        if initial is None:
+            initial = float(self.cfg["initial_cash_usd"]) + float(self.cfg["initial_cash_krw"]) / v["fx_rate"]
+        initial = float(initial)
         fx_cost = sum((float(e.get("krw", 0)) / v["fx_rate"]) - float(e.get("usd", 0))
                       for e in self.state.get("fx_events", []))      # 환전 스프레드로 새어나간 USD 환산액
         return {
@@ -708,6 +711,9 @@ class PaperBroker:
             "last_run_asof": self.get_meta("last_run_asof"),
             "last_run_ts": self.get_meta("last_run_ts"),
             "created": self.state.get("created"),
+            "initial_krw": self.get_meta("initial_krw"),
+            "initial_fx_rate": self.get_meta("initial_fx_rate"),
+            "initial_fx_spread_pct": self.get_meta("initial_fx_spread_pct"),
             "positions": v["positions"],
         }
 
