@@ -91,11 +91,20 @@ def rebalance_mode(cfg):
 
 
 # ── 목표비중 ───────────────────────────────────────────────────────────────
-def target_weights(cands):
-    """{SYM: 비중} (합 1). 점수가 없거나 0 이하인 종목은 목록 최저 양수점수의 10% 로 둔다.
-    점수가 하나도 없으면 균등."""
+def weighting(cfg):
+    w = str(_section(cfg, "sizing", {"weighting": "score"}).get("weighting", "score")).lower()
+    if w not in ("score", "equal"):
+        raise ValueError(f"설정 sizing.weighting 은 score 또는 equal: {w!r}")
+    return w
+
+
+def target_weights(cands, method="score"):
+    """{SYM: 비중} (합 1). method=equal 이면 균등.
+    score: 점수가 없거나 0 이하인 종목은 목록 최저 양수점수의 10% 로 둔다. 점수가 하나도 없으면 균등."""
     if not cands:
         return {}
+    if method == "equal":
+        return {str(c["symbol"]).upper(): 1.0 / len(cands) for c in cands}
     scores = []
     for c in cands:
         try:
@@ -209,7 +218,7 @@ def plan_trims(cands, holdings, quotes, cash_usd, cfg, asof, exclude=()):
     sz = _section(cfg, "sizing", DEFAULT_SIZING)
     thr = _float(reb, "rebalance", "topup_threshold_pct") / 100.0
     min_order = _float(sz, "sizing", "min_order_usd")
-    w = target_weights(cands)
+    w = target_weights(cands, weighting(cfg))
     vals = position_values(holdings, quotes)
     equity = float(cash_usd or 0.0) + sum(vals.values())
     out = []
@@ -252,7 +261,7 @@ def plan_buys(cands, holdings, quotes, cash_usd, cfg, asof, open_orders=None, ex
     quotes = {str(k).upper(): float(v) for k, v in (quotes or {}).items() if v}
     held = set(holdings)
     pending = pending_buy_symbols(open_orders)
-    w = target_weights(cands)
+    w = target_weights(cands, weighting(cfg))
     vals = position_values(holdings, quotes)
     cash = float(cash_usd or 0.0)
     equity = cash + sum(vals.values())
@@ -364,4 +373,5 @@ def rule_label(cfg):
                 else f"게이트탈락 {ex['gate_absent_weeks']}회")
         sell = f"{stop} · {gate}"
     off = (cfg.get("schedule") or {}).get("entry_offset_min", 45)
-    return f"v2 — 상위 {src.get('top_n')}종 점수가중 · {mname}({m}) · {sell} · 정규장 +{off}분 시장가"
+    wname = "균등가중" if weighting(cfg) == "equal" else "점수가중"
+    return f"v2 — 상위 {src.get('top_n')}종 {wname} · {mname}({m}) · {sell} · 정규장 +{off}분 시장가"

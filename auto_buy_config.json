@@ -22,7 +22,7 @@
   },
   "exit": {
     "enabled": true,
-    "trailing_stop_pct": 15,
+    "trailing_stop_pct": 0,
     "gate_absent_weeks": 1,
     "rule": "drop_from_list",
     "weeks_absent": 2
@@ -52,6 +52,6 @@
   "rebalance": {
     "mode": "C",
     "topup_threshold_pct": 30,
-    "every_weeks": 4
+    "every_weeks": 3
   }
 }

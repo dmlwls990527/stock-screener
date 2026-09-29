@@ -1152,7 +1152,7 @@ def add_v2_columns(cfg, pos_df, broker):
     es = es_load(broker)
     pct = strategy.exit_cfg(cfg)["trailing_stop_pct"]
     eq = broker.summary()["equity_usd"] or 0.0
-    w = strategy.target_weights(ctx["cands"]) if ctx else {}
+    w = strategy.target_weights(ctx["cands"], strategy.weighting(cfg)) if ctx else {}
     cols = ["목표비중%", "보유비중%", "최고가", "손절가", "탈락주수", "매도대기"]
     rows = []
     for _, r in pos_df.iterrows():
@@ -1248,7 +1248,7 @@ def build_parser():
     rr.add_argument("--refresh", action="store_true", help="스크리닝 캐시 무시하고 다시 계산")
     rr.add_argument("--out", default=None, help="결과 엑셀 경로 (기본 paper_replay_latest.xlsx)")
     rr.add_argument("--compare", action="store_true", help="여러 설정을 같은 스크리닝으로 비교")
-    rr.add_argument("--compare-set", default="rebal", choices=["rebal", "rules"],
+    rr.add_argument("--compare-set", default="rebal", choices=["rebal", "rules", "grid"],
                     help="rebal = 리밸런스 주기·종목수·손절 비교 / rules = v1·v2-A/B/C")
     rs = sp.add_parser("reset", parents=[common], help="페이퍼 상태 초기화")
     rs.add_argument("--yes", action="store_true")

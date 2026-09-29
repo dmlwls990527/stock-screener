@@ -1133,9 +1133,9 @@ _V1 = {"sizing": {"method": "equal", "per_stock_usd": 1000, "weekly_cap_usd": 30
        "source": {"top_n": 5, "exclude_if_주의": True}, "exit": {"enabled": False}}
 
 
-def _R(every, top_n=50, stop=0):
+def _R(every, top_n=50, stop=0, weighting="score"):
     """정기 리밸런스: every 주마다 목록·비중 재계산, 목록 밖은 매도(탈락 1회), 비중 ±30% 벗어나면 양방향 조정."""
-    return {"sizing": {"method": "score_weight"}, "source": {"top_n": top_n},
+    return {"sizing": {"method": "score_weight", "weighting": weighting}, "source": {"top_n": top_n},
             "rebalance": {"mode": "C", "every_weeks": every},
             "exit": {"enabled": True, "gate_absent_weeks": 1, "trailing_stop_pct": stop}}
 
@@ -1156,7 +1156,58 @@ VARIANT_SETS = {
                ("R4_stop15", "정기 리밸런스 4주 · 50종 · 손절 −15%", _R(4, stop=15)),
                ("R4_top20", "정기 리밸런스 4주 · 상위 20종 · 손절없음", _R(4, top_n=20))],
               "R4"),
+    # 2020~ 규칙 정하기용: 주기 1/2/3/4주 × 상위 20/50, 손절 없음, 점수가중 (+ 3주·50 균등가중 하나)
+    "grid": ([("R1_50", "매주 · 50종 · 점수가중", _R(1)),
+              ("R2_50", "2주 · 50종 · 점수가중", _R(2)),
+              ("R3_50", "3주 · 50종 · 점수가중", _R(3)),
+              ("R4_50", "4주 · 50종 · 점수가중", _R(4)),
+              ("R1_20", "매주 · 상위20 · 점수가중", _R(1, top_n=20)),
+              ("R2_20", "2주 · 상위20 · 점수가중", _R(2, top_n=20)),
+              ("R3_20", "3주 · 상위20 · 점수가중", _R(3, top_n=20)),
+              ("R4_20", "4주 · 상위20 · 점수가중", _R(4, top_n=20)),
+              ("R3_50_eq", "3주 · 50종 · 균등가중", _R(3, weighting="equal"))],
+             "R3_50"),
 }
+
+
+def _yearly_returns(series, initial):
+    """거래일(str)→자산 Series → {연도: 수익률%}. 첫해는 초기자본 대비, 이후는 전년 말 대비."""
+    out, prev = {}, float(initial)
+    s = series.dropna()
+    for y in sorted({str(d)[:4] for d in s.index}):
+        part = s[[str(d)[:4] == y for d in s.index]]
+        if not len(part) or not prev:
+            continue
+        out[y] = (float(part.iloc[-1]) / prev - 1) * 100
+        prev = float(part.iloc[-1])
+    return out
+
+
+def yearly_table(results, variants, main_key):
+    """설정별 연도 수익률·벤치마크 초과·이긴 해·지배연도(초과가 가장 큰 해)를 빼고 본 평균 초과."""
+    b = results[main_key]["bench"]
+    initial = float(results[main_key]["broker"].summary()["initial_equity_usd"])
+    curve = b.get("curve")
+    bench_y = _yearly_returns(curve * initial, initial) if curve is not None and len(curve) else {}
+    years = sorted(bench_y)
+    rows = [dict({"설정": "벤치마크", "설명": "첫 기준일 유니버스 동일가중 매수후보유"},
+                 **{y: round(bench_y[y], 1) for y in years})]
+    stats = {}
+    for key, label in variants:
+        e = results[key]["equity"]
+        ry = _yearly_returns(pd.Series(e["equity_usd"].values, index=e["거래일"].values), initial) if len(e) else {}
+        ex = {y: ry[y] - bench_y[y] for y in years if y in ry}
+        wins = sum(1 for v in ex.values() if v > 0)
+        dom = max(ex, key=lambda y: ex[y]) if ex else None
+        rest = [v for y, v in ex.items() if y != dom]
+        st = {"이긴해": f"{wins}/{len(ex)}",
+              "연도중앙 초과%p": round(float(pd.Series(list(ex.values())).median()), 1) if ex else None,
+              "지배연도": dom,
+              "지배연도제외 평균초과%p": round(sum(rest) / len(rest), 1) if rest else None}
+        stats[key] = st
+        rows.append(dict({"설정": key, "설명": label}, **{y: round(ry[y], 1) for y in years if y in ry}))
+        rows.append(dict({"설정": key, "설명": "  └ 벤치마크 대비 %p"}, **{y: round(ex[y], 1) for y in ex}, **st))
+    return pd.DataFrame(rows), stats
 VARIANTS = [(k, lbl) for k, lbl, _ in VARIANT_SETS["rules"][0]]
 
 
@@ -1242,6 +1293,14 @@ def compare(start=DEFAULT_START, end=None, cadence="weekly", cfg=None, out=OUT_X
     cmp_df = pd.DataFrame(rows)
     cmp_df["벤치마크 동일가중B&H%"] = round(b["ew_return_pct"], 2) if b.get("ew_return_pct") is not None else None
     cmp_df["벤치마크 중앙값%"] = round(b["median_return_pct"], 2) if b.get("median_return_pct") is not None else None
+    ydf, ystats = yearly_table(results, [(k, l) for k, l, _ in variants], main_key)
+    for col in ("이긴해", "연도중앙 초과%p", "지배연도", "지배연도제외 평균초과%p"):
+        cmp_df[col] = cmp_df["설정"].map(lambda k: ystats.get(k, {}).get(col))
+    first = results[main_key].get("first_fill")
+    if first:
+        yrs = (pd.Timestamp(end) - pd.Timestamp(first)).days / 365.25
+        cmp_df["연평균수익률%"] = ((cmp_df["최종자산($)"] / cmp_df["초기자산($)"]) ** (1 / yrs) - 1).mul(100).round(2)
+    cmp_df.attrs["yearly"] = ydf
     write_compare_report(cmp_df, results, cfgs, out, cadence, split_events,
                          variants=[(k, l) for k, l, _ in variants], main_key=main_key)
     log.info("compare 완료 → %s", out)
@@ -1275,6 +1334,8 @@ def write_compare_report(cmp_df, results, cfgs, out, cadence, split_events=None,
     os.makedirs(os.path.dirname(os.path.abspath(out)) or ".", exist_ok=True)
     with pd.ExcelWriter(out, engine="openpyxl") as xw:
         cmp_df.to_excel(xw, sheet_name="비교", index=False)
+        if isinstance(cmp_df.attrs.get("yearly"), pd.DataFrame):
+            cmp_df.attrs["yearly"].to_excel(xw, sheet_name="연도별", index=False)
         summary_df.to_excel(xw, sheet_name=f"요약({main_key})", index=False)
         (eq if eq is not None else pd.DataFrame()).to_excel(xw, sheet_name="자산추이", index=False)
         for key, _ in variants:

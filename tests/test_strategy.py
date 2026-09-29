@@ -418,5 +418,40 @@ class TestAutoBuyEveryWeeks(TestAutoBuyV2):
         self.assertEqual(st["meta"]["last_rebalance_asof"], "2026-10-16")
 
 
+
+
+# ── 균등가중 / 2020~ 비교 세트 / 연도별 표 ─────────────────────────────────
+class TestGrid(unittest.TestCase):
+    def test_equal_weighting(self):
+        c = cands([("A", 3.0), ("B", 1.0)])
+        self.assertEqual(strategy.target_weights(c, "equal"), {"A": 0.5, "B": 0.5})
+        cfg = v2cfg()
+        cfg["sizing"]["weighting"] = "equal"
+        plan = strategy.plan_buys(c, {}, {"A": 10.0, "B": 10.0}, 1000.0, cfg, "x")
+        amts = [o["order_amount"] for o in plan]
+        self.assertAlmostEqual(amts[0], amts[1], places=2)
+        self.assertIn("균등가중", strategy.rule_label(cfg))
+        cfg["sizing"]["weighting"] = "bogus"
+        with self.assertRaises(ValueError):
+            strategy.weighting(cfg)
+
+    def test_grid_variant_set(self):
+        v = replay.variant_configs(v2cfg(), "grid")
+        self.assertEqual(len(v), 9)
+        self.assertEqual([strategy.every_weeks(v[k]) for k in ("R1_50", "R2_50", "R3_50", "R4_50")], [1, 2, 3, 4])
+        self.assertEqual(v["R2_20"]["source"]["top_n"], 20)
+        self.assertEqual(strategy.weighting(v["R3_50_eq"]), "equal")
+        self.assertEqual(strategy.weighting(v["R3_50"]), "score")
+        self.assertEqual(v["R3_50"]["exit"]["trailing_stop_pct"], 0)
+
+    def test_yearly_returns(self):
+        s = pd.Series([100.0, 110.0, 121.0, 108.9],
+                      index=["2020-06-01", "2020-12-31", "2021-12-31", "2022-12-30"])
+        r = replay._yearly_returns(s, 100.0)
+        self.assertAlmostEqual(r["2020"], 10.0)
+        self.assertAlmostEqual(r["2021"], 10.0)
+        self.assertAlmostEqual(r["2022"], -10.0)
+
+
 if __name__ == "__main__":
     unittest.main()
