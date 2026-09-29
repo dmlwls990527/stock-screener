@@ -52,6 +52,7 @@ sys.path.insert(0, BASE_DIR)
 
 import rules                                          # noqa: E402
 import strategy                                  # noqa: E402  (v2 규칙)
+import candidates                                # noqa: E402  (상위 N 채움 목록)
 from broker_paper import PaperBroker, KST             # noqa: E402
 
 CACHE_DIR = os.path.join(BASE_DIR, "paper", "replay_cache")
@@ -1070,7 +1071,7 @@ def simulate_v2(dates, trading_days, screen_fn, panel, cfg, state_path, end=None
         scr = screen_fn(asof)
         n_screens += 1
         n_cached += 1 if scr.get("cached") else 0
-        wl = scr.get("watchlist")
+        wl = candidates.watchlist_for(scr, cfg)          # candidates.mode=top_fill 이면 상위 N 채움 목록
         wl = wl if wl is not None else empty_watchlist()
         if bench_universe is None:
             uni = scr.get("universe")
@@ -1217,6 +1218,16 @@ def _R(every, top_n=50, stop=0, weighting="score", stop_type="trailing"):
             "exit": {"enabled": True, "gate_absent_weeks": 1, "trailing_stop_pct": stop, "stop_type": stop_type}}
 
 
+def _F(every=3, stop=0, n=10):
+    """2026-09-29 규칙: 항상 상위 n 종목(통과 → 점수순 채움), 순위가중, 목록 밖이면 리밸런스 때 매도,
+    고정손절(매입가 대비, 0=없음), 크기조건은 유니버스 안 상위 비율."""
+    return {"sizing": {"method": "score_weight", "weighting": "rank", "max_positions": n},
+            "source": {"top_n": n, "sort_by": "우선점수", "exclude_if_주의": False},
+            "rebalance": {"mode": "C", "every_weeks": every},
+            "exit": {"enabled": True, "gate_absent_weeks": 1, "trailing_stop_pct": stop, "stop_type": "fixed"},
+            "candidates": {"mode": "top_fill", "n": n}}
+
+
 # 세트 이름 → ([(키, 설명, 설정 덮어쓰기)], 요약 시트에 쓸 대표 키)
 VARIANT_SETS = {
     "rules": ([("v1_equal", "v1 균등(상위5·종목당$1000·매도없음)", _V1),
@@ -1245,6 +1256,13 @@ VARIANT_SETS = {
               ("R3_50_eq", "3주 · 50종 · 균등가중", _R(3, weighting="equal"))],
              "R3_50"),
     # 손절 비율 비교: 3주 · 50종 · 점수가중 고정, 손절만 바꾼다
+    "final": ([("F3_nostop", "3주 · 상위10 · 순위가중 · 손절없음", _F()),
+               ("F3_fix10", "3주 · 상위10 · 순위가중 · 고정손절 −10%", _F(stop=10)),
+               ("F3_fix20", "3주 · 상위10 · 순위가중 · 고정손절 −20%", _F(stop=20)),
+               ("F3_fix30", "3주 · 상위10 · 순위가중 · 고정손절 −30%", _F(stop=30)),
+               ("F2_nostop", "2주 · 상위10 · 순위가중 · 손절없음", _F(every=2)),
+               ("F4_nostop", "4주 · 상위10 · 순위가중 · 손절없음", _F(every=4))],
+              "F3_nostop"),
     "stops": ([("R3_nostop", "3주·50종 · 손절 없음", _R(3))]
               + [(f"T{p}", f"3주·50종 · 추적손절 −{p}% (최고가 대비)", _R(3, stop=p)) for p in (10, 15, 20, 25, 30)]
               + [(f"F{p}", f"3주·50종 · 손절 −{p}% (매입가 대비)", _R(3, stop=p, stop_type="fixed")) for p in (10, 20, 30)],
@@ -1475,6 +1493,8 @@ def replay(start=DEFAULT_START, end=None, cadence="weekly", cfg=None, out=OUT_XL
     t0 = time.time()
     if cadence == "weekly":
         dates = dates[::strategy.every_weeks(cfg)]
+    if state_path == REPLAY_STATE and universe != "db":          # 동시에 여러 유니버스를 돌려도 상태 파일이 안 겹치게
+        state_path = REPLAY_STATE.replace(".json", f"_{universe}.json")
     res = simulate(dates, trading_days, screen_fn, panel, cfg, state_path, end=end)
     summary_df = write_report(res, cfg, out, cadence, split_events)
     log.info("replay 완료 %.1fs → %s (상태 %s)", time.time() - t0, out, state_path)

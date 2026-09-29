@@ -521,5 +521,52 @@ class TestPointInTime(unittest.TestCase):
         self.assertTrue(replay.cache_path("2020-01-03", 45, "sp500_pit").endswith("screen_v2_lag45_sp500pit_2020-01-03.pkl"))
 
 
+
+
+# ── 상위 10 고정 · 순위가중 · 비율 크기조건 ─────────────────────────────────
+import candidates                                              # noqa: E402
+
+
+def uni_df(rows):
+    """rows: (CODE, MC0_B, amt20_m, rs_pct, near_high, lead_score, 탈락사유)"""
+    return pd.DataFrame(rows, columns=["CODE", "MC0_B", "amt20_m", "rs_pct", "near_high", "lead_score", "탈락사유"]
+                        ).assign(NAME=lambda d: d["CODE"], 섹터="IT", 유형="", 주의="")
+
+
+class TestTopFill(unittest.TestCase):
+    def test_rank_weights(self):
+        w = strategy.target_weights(cands([("A", 1), ("B", 5), ("C", 9)]), "rank")
+        self.assertAlmostEqual(w["A"], 3 / 6)
+        self.assertAlmostEqual(w["B"], 2 / 6)
+        self.assertAlmostEqual(w["C"], 1 / 6)
+
+    def test_passers_first_then_fill_by_score_quality_kept(self):
+        u = uni_df([
+            ("P1", 100, 900, 90, 95, 0.60, "통과"),
+            ("P2", 100, 900, 85, 90, 0.70, "통과"),
+            ("F1", 100, 900, 50, 70, 0.90, "RS<80, 고점85%미만"),        # 점수 높아도 통과 뒤로
+            ("F2", 100, 900, 60, 80, 0.50, "RS<80"),
+            ("BAD", 100, 900, 95, 99, 0.99, "영업적자/무재무"),           # 품질 탈락은 채움에서도 제외
+            ("SPK", 100, 900, 95, 99, 0.95, "단발스파이크"),
+            ("TINY", 0.1, 1, 95, 99, 0.98, "시총<10B, 거래대금<300M"),    # 크기 하위 → 제외
+        ])
+        out = candidates.top_fill(u, n=4, mc_top=0.8, amt_top=0.8)   # 7종목 중 가장 작은 1개(하위 14%)가 빠지는 기준
+        self.assertEqual(out["티커"].tolist(), ["P2", "P1", "F1", "F2"])
+        self.assertEqual(out["구분"].tolist(), ["통과", "통과", "채움", "채움"])
+        self.assertEqual(out["우선점수"].tolist(), [4, 3, 2, 1])
+        c = rules.select_candidates(out, {"source": {"sort_by": "우선점수", "top_n": 10, "exclude_if_주의": False}})
+        self.assertEqual([x["symbol"] for x in c], ["P2", "P1", "F1", "F2"])
+
+    def test_final_variant_set(self):
+        v = replay.variant_configs(v2cfg(), "final")
+        self.assertEqual(list(v), ["F3_nostop", "F3_fix10", "F3_fix20", "F3_fix30", "F2_nostop", "F4_nostop"])
+        f = v["F3_fix20"]
+        self.assertEqual((f["exit"]["stop_type"], f["exit"]["trailing_stop_pct"]), ("fixed", 20))
+        self.assertEqual(strategy.weighting(f), "rank")
+        self.assertEqual(candidates.params(f)["mode"], "top_fill")
+        self.assertEqual(f["source"]["top_n"], 10)
+        self.assertIn("순위가중", strategy.rule_label(f))
+
+
 if __name__ == "__main__":
     unittest.main()

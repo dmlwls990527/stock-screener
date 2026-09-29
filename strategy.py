@@ -98,8 +98,8 @@ def rebalance_mode(cfg):
 # ── 목표비중 ───────────────────────────────────────────────────────────────
 def weighting(cfg):
     w = str(_section(cfg, "sizing", {"weighting": "score"}).get("weighting", "score")).lower()
-    if w not in ("score", "equal"):
-        raise ValueError(f"설정 sizing.weighting 은 score 또는 equal: {w!r}")
+    if w not in ("score", "equal", "rank"):
+        raise ValueError(f"설정 sizing.weighting 은 score / equal / rank: {w!r}")
     return w
 
 
@@ -110,6 +110,10 @@ def target_weights(cands, method="score"):
         return {}
     if method == "equal":
         return {str(c["symbol"]).upper(): 1.0 / len(cands) for c in cands}
+    if method == "rank":        # 1위 n, 2위 n−1 … n위 1 (목록 순서 = 순위)
+        n = len(cands)
+        tot = n * (n + 1) / 2
+        return {str(c["symbol"]).upper(): (n - i) / tot for i, c in enumerate(cands)}
     scores = []
     for c in cands:
         try:
@@ -388,5 +392,5 @@ def rule_label(cfg):
                 else f"게이트탈락 {ex['gate_absent_weeks']}회")
         sell = f"{stop} · {gate}"
     off = (cfg.get("schedule") or {}).get("entry_offset_min", 45)
-    wname = "균등가중" if weighting(cfg) == "equal" else "점수가중"
+    wname = {"equal": "균등가중", "rank": "순위가중", "score": "점수가중"}[weighting(cfg)]
     return f"v2 — 상위 {src.get('top_n')}종 {wname} · {mname}({m}) · {sell} · 정규장 +{off}분 시장가"
