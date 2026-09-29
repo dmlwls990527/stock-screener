@@ -355,5 +355,68 @@ class TestReplayV2(unittest.TestCase):
         self.assertEqual([v[k]["rebalance"]["mode"] for k in ("v2_A", "v2_B", "v2_C")], ["A", "B", "C"])
 
 
+
+
+# ── 정기 리밸런싱 (N주마다) ────────────────────────────────────────────────
+class TestPeriodicRebalance(unittest.TestCase):
+    def test_rebalance_due(self):
+        cfg = v2cfg("C")
+        cfg["rebalance"]["every_weeks"] = 4
+        self.assertEqual(strategy.rebalance_due(cfg, "2026-09-25", None), (True, None))
+        self.assertFalse(strategy.rebalance_due(cfg, "2026-10-16", "2026-09-25")[0])     # 3주
+        self.assertTrue(strategy.rebalance_due(cfg, "2026-10-23", "2026-09-25")[0])      # 4주
+        self.assertTrue(strategy.rebalance_due(cfg, "2026-10-21", "2026-09-25")[0])      # 휴장으로 이틀 당겨짐
+        cfg["rebalance"]["every_weeks"] = 1
+        self.assertTrue(strategy.rebalance_due(cfg, "2026-09-26", "2026-09-25")[0])
+
+    def test_trailing_off_when_pct_zero(self):
+        es = strategy.sync_exit_state({}, {"A": {"qty": 1.0, "avg_price": 100.0}})
+        self.assertEqual(strategy.check_trailing(es, {"A": 1.0}, 0, "t"), [])
+        self.assertIsNone(es["A"]["pending_exit"])
+
+    def test_rebal_variant_set(self):
+        v = replay.variant_configs(v2cfg(), "rebal")
+        self.assertEqual(strategy.every_weeks(v["R4"]), 4)
+        self.assertEqual(v["R4"]["rebalance"]["mode"], "C")
+        self.assertEqual(v["R4"]["exit"]["gate_absent_weeks"], 1)
+        self.assertEqual(v["R4_top20"]["source"]["top_n"], 20)
+        self.assertEqual(v["R4_stop15"]["exit"]["trailing_stop_pct"], 15)
+        self.assertEqual(v["v2_B_weekly"]["rebalance"]["mode"], "B")
+        self.assertIn("4주마다", strategy.rule_label(v["R4"]))
+
+
+class TestAutoBuyEveryWeeks(TestAutoBuyV2):
+    # 부모의 시나리오 테스트는 매주 설정 전제라 여기서는 돌리지 않는다 (setUp·헬퍼만 재사용)
+    test_three_week_walk = test_entry_window_gating = test_convert_at_start_math = None
+    test_ignore_hours_refused_in_live = None
+
+    def setUp(self):
+        super().setUp()
+        cfg = json.load(open(self.cfg_path, encoding="utf-8"))
+        cfg["rebalance"].update({"mode": "C", "every_weeks": 2})
+        cfg["exit"]["gate_absent_weeks"] = 1
+        json.dump(cfg, open(self.cfg_path, "w", encoding="utf-8"), ensure_ascii=False)
+
+    def _week(self, day, asof, tickers):
+        self.write_wl(tickers, asof)
+        self.s.cal_day = synthetic_calendar(datetime(2026, 10, day, 23, 20, tzinfo=KST))
+        self.s.now = datetime(2026, 10, day, 23, 20, tzinfo=KST)
+        return self.ab("run")
+
+    def test_skips_off_weeks_then_sells_dropped_and_rebalances(self):
+        self.assertEqual(self._week(5, "2026-10-02", ["AAA", "BBB", "CCC"]), 0)      # 첫 리밸런스
+        n = len(self.st()["fills"])
+        self.assertEqual(self._week(12, "2026-10-09", ["DDD"]), 3)                    # 1주 뒤 → 건너뜀
+        self.assertEqual(len(self.st()["fills"]), n)
+        self.assertEqual(self._week(19, "2026-10-16", ["AAA", "DDD"]), 0)             # 2주 뒤 → 리밸런스
+        st = self.st()
+        new = [(f["symbol"], f["side"]) for f in st["fills"][n:]]
+        self.assertIn(("BBB", "SELL"), new)                                           # 목록 밖 → 매도
+        self.assertIn(("CCC", "SELL"), new)
+        self.assertIn(("DDD", "BUY"), new)
+        self.assertEqual(set(st["positions"]), {"AAA", "DDD"})
+        self.assertEqual(st["meta"]["last_rebalance_asof"], "2026-10-16")
+
+
 if __name__ == "__main__":
     unittest.main()

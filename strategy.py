@@ -31,7 +31,7 @@ import re
 from rules import (OrderPlan, REASON_NO_QUOTE, REASON_PENDING, _section, _float, _int,
                    cash_buffer_pct, pending_buy_symbols)
 
-DEFAULT_REBALANCE = {"mode": "B", "topup_threshold_pct": 30}
+DEFAULT_REBALANCE = {"mode": "B", "topup_threshold_pct": 30, "every_weeks": 1}
 DEFAULT_EXIT = {"enabled": True, "trailing_stop_pct": 15, "gate_absent_weeks": 2}
 DEFAULT_SIZING = {"max_positions": 50, "min_order_usd": 20}
 
@@ -59,6 +59,28 @@ def exit_cfg(cfg):
     return {"enabled": bool(ex.get("enabled", True)),
             "trailing_stop_pct": _float(ex, "exit", "trailing_stop_pct"),
             "gate_absent_weeks": max(1, _int(ex, "exit", "gate_absent_weeks"))}
+
+
+def every_weeks(cfg):
+    """리밸런스 주기(주). 1 = 매주. 기준일(금요일 워치리스트)이 이만큼 지나야 다음 리밸런스."""
+    v = _section(cfg, "rebalance", DEFAULT_REBALANCE).get("every_weeks", 1)
+    try:
+        n = int(v or 1)
+    except (TypeError, ValueError):
+        raise ValueError(f"설정 rebalance.every_weeks 는 정수여야 함: {v!r}") from None
+    return max(1, n)
+
+
+def rebalance_due(cfg, asof, last_rebalance_asof):
+    """(이번 기준일이 리밸런스 주인가, 아니면 그 사유). 공휴일로 기준일이 며칠 당겨져도 인정(−3일)."""
+    n = every_weeks(cfg)
+    if n <= 1 or not last_rebalance_asof:
+        return True, None
+    from datetime import date
+    d = (date.fromisoformat(str(asof)[:10]) - date.fromisoformat(str(last_rebalance_asof)[:10])).days
+    if d >= n * 7 - 3:
+        return True, None
+    return False, f"리밸런스 주 아님 (마지막 리밸런스 기준일 {last_rebalance_asof}, {n}주마다, {d}일 경과)"
 
 
 def rebalance_mode(cfg):
@@ -134,8 +156,11 @@ def stop_price(st, pct):
 
 
 def check_trailing(es, quotes, pct, ts):
-    """시세 ≤ 최고가×(1−pct%) 이면 pending_exit 표시. 새로 걸린 종목 리스트를 돌려준다."""
+    """시세 ≤ 최고가×(1−pct%) 이면 pending_exit 표시. 새로 걸린 종목 리스트를 돌려준다.
+    pct 가 0 이하(또는 100 이상)면 추적손절 끔."""
     hits = []
+    if not pct or pct <= 0 or pct >= 100:
+        return hits
     for sym, st in es.items():
         if st.get("pending_exit"):
             continue
@@ -329,7 +354,14 @@ def rule_label(cfg):
     ex = exit_cfg(cfg)
     m = rebalance_mode(cfg)
     mname = {"A": "보유 유지", "B": "추가매수만", "C": "양방향 리밸런스"}[m]
-    sell = (f"추적손절 −{ex['trailing_stop_pct']:g}% · 게이트탈락 {ex['gate_absent_weeks']}주"
-            if ex["enabled"] else "매도규칙 꺼짐")
+    n = every_weeks(cfg)
+    mname += " 매주" if n <= 1 else f" {n}주마다"
+    if not ex["enabled"]:
+        sell = "매도규칙 꺼짐"
+    else:
+        stop = (f"추적손절 −{ex['trailing_stop_pct']:g}%" if 0 < ex["trailing_stop_pct"] < 100 else "추적손절 없음")
+        gate = ("리밸런스 때 목록 밖이면 매도" if ex["gate_absent_weeks"] <= 1
+                else f"게이트탈락 {ex['gate_absent_weeks']}회")
+        sell = f"{stop} · {gate}"
     off = (cfg.get("schedule") or {}).get("entry_offset_min", 45)
     return f"v2 — 상위 {src.get('top_n')}종 점수가중 · {mname}({m}) · {sell} · 정규장 +{off}분 시장가"

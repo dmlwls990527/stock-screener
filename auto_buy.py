@@ -758,7 +758,7 @@ def cmd_replay(cfg, args, inj):
     if getattr(args, "out", None):
         kwargs["out"] = args.out
     if getattr(args, "compare", False):
-        res = replay.compare(**kwargs)
+        res = replay.compare(variant_set=getattr(args, "compare_set", "rebal"), **kwargs)
         log.info("비교 결과:\n%s", res.to_string(index=False) if hasattr(res, "to_string") else res)
         return 0
     log.info("replay 시작 %s (기준일마다 스크리닝 10~20s, 캐시 paper/replay_cache/ 에 있으면 즉시)",
@@ -1054,6 +1054,10 @@ def cmd_run_v2(cfg, args, inj):
     if broker_meta_get(broker, "last_run_asof") == asof and not getattr(args, "force", False):
         log.info("[SKIP] 이미 이번 기준일(%s) 실행됨. 손절 청산은 exits 가 한다. 다시 하려면 --force", asof)
         return 3
+    due, why_rb = strategy.rebalance_due(cfg, asof, broker_meta_get(broker, "last_rebalance_asof"))
+    if not due and not getattr(args, "force", False):
+        log.info("[SKIP] %s. 그 사이 손절 청산은 exits 가 한다", why_rb)
+        return 3
     ok, why = entry_gate(cfg, broker, args, is_live)
     if not ok:
         log.info("[SKIP] %s → 아무것도 안 함", why)
@@ -1104,8 +1108,8 @@ def cmd_run_v2(cfg, args, inj):
     if no_quote:
         log.warning("시세가 없어 이번에 빠진 후보: %s", no_quote)
     if filled or (is_live and pending) or (attempted == 0 and not no_quote):
-        broker_meta_set(broker, last_run_asof=asof, last_run_ts=fmt_ts(now_kst()))
-        log.info("기준일 %s 실행 완료로 기록", asof)
+        broker_meta_set(broker, last_run_asof=asof, last_rebalance_asof=asof, last_run_ts=fmt_ts(now_kst()))
+        log.info("기준일 %s 실행 완료로 기록 (다음 리밸런스: %d주 뒤)", asof, strategy.every_weeks(cfg))
         rc = 0
     else:
         log.warning("체결 0건 → 기준일 기록 안 함 (다음 발화에서 다시 시도)")
@@ -1243,7 +1247,9 @@ def build_parser():
     rr.add_argument("--cadence", default=None, choices=["weekly", "monthly"])
     rr.add_argument("--refresh", action="store_true", help="스크리닝 캐시 무시하고 다시 계산")
     rr.add_argument("--out", default=None, help="결과 엑셀 경로 (기본 paper_replay_latest.xlsx)")
-    rr.add_argument("--compare", action="store_true", help="v1균등 / v2-A / v2-B / v2-C 비교")
+    rr.add_argument("--compare", action="store_true", help="여러 설정을 같은 스크리닝으로 비교")
+    rr.add_argument("--compare-set", default="rebal", choices=["rebal", "rules"],
+                    help="rebal = 리밸런스 주기·종목수·손절 비교 / rules = v1·v2-A/B/C")
     rs = sp.add_parser("reset", parents=[common], help="페이퍼 상태 초기화")
     rs.add_argument("--yes", action="store_true")
     sp.add_parser("config", parents=[common], help="설정 출력")

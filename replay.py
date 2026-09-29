@@ -1128,29 +1128,48 @@ def simulate_v2(dates, trading_days, screen_fn, panel, cfg, state_path, end=None
 
 
 # ── 규칙 비교 (같은 스크리닝·같은 가격으로 4개 설정) ─────────────────────────
-VARIANTS = [("v1_equal", "v1 균등(상위5·종목당$1000·매도없음)"), ("v2_A", "v2-A 보유유지"),
-            ("v2_B", "v2-B 추가매수만"), ("v2_C", "v2-C 양방향")]
+_V1 = {"sizing": {"method": "equal", "per_stock_usd": 1000, "weekly_cap_usd": 3000, "max_positions": 10,
+                  "skip_if_held": True, "min_order_usd": 50},
+       "source": {"top_n": 5, "exclude_if_주의": True}, "exit": {"enabled": False}}
 
 
-def variant_configs(cfg):
+def _R(every, top_n=50, stop=0):
+    """정기 리밸런스: every 주마다 목록·비중 재계산, 목록 밖은 매도(탈락 1회), 비중 ±30% 벗어나면 양방향 조정."""
+    return {"sizing": {"method": "score_weight"}, "source": {"top_n": top_n},
+            "rebalance": {"mode": "C", "every_weeks": every},
+            "exit": {"enabled": True, "gate_absent_weeks": 1, "trailing_stop_pct": stop}}
+
+
+# 세트 이름 → ([(키, 설명, 설정 덮어쓰기)], 요약 시트에 쓸 대표 키)
+VARIANT_SETS = {
+    "rules": ([("v1_equal", "v1 균등(상위5·종목당$1000·매도없음)", _V1),
+               ("v2_A", "v2-A 보유유지", {"sizing": {"method": "score_weight"}, "rebalance": {"mode": "A"}}),
+               ("v2_B", "v2-B 추가매수만", {"sizing": {"method": "score_weight"}, "rebalance": {"mode": "B"}}),
+               ("v2_C", "v2-C 양방향", {"sizing": {"method": "score_weight"}, "rebalance": {"mode": "C"}})],
+              "v2_B"),
+    "rebal": ([("v2_B_weekly", "기존 v2-B (매주 신규만·게이트2주·손절15%)",
+                {"sizing": {"method": "score_weight"}, "rebalance": {"mode": "B", "every_weeks": 1},
+                 "exit": {"enabled": True, "gate_absent_weeks": 2, "trailing_stop_pct": 15}}),
+               ("R1", "정기 리밸런스 매주 · 50종 · 손절없음", _R(1)),
+               ("R2", "정기 리밸런스 2주 · 50종 · 손절없음", _R(2)),
+               ("R4", "정기 리밸런스 4주 · 50종 · 손절없음", _R(4)),
+               ("R4_stop15", "정기 리밸런스 4주 · 50종 · 손절 −15%", _R(4, stop=15)),
+               ("R4_top20", "정기 리밸런스 4주 · 상위 20종 · 손절없음", _R(4, top_n=20))],
+              "R4"),
+}
+VARIANTS = [(k, lbl) for k, lbl, _ in VARIANT_SETS["rules"][0]]
+
+
+def _merge(base, over):
     import copy
-    out = {}
-    for key, _label in VARIANTS:
-        c = copy.deepcopy(cfg)
-        c.setdefault("sizing", {})
-        c.setdefault("source", {})
-        c.setdefault("exit", {})
-        c.setdefault("rebalance", {})
-        if key == "v1_equal":
-            c["sizing"].update({"method": "equal", "per_stock_usd": 1000, "weekly_cap_usd": 3000,
-                                "max_positions": 10, "skip_if_held": True, "min_order_usd": 50})
-            c["source"].update({"top_n": 5, "exclude_if_주의": True})
-            c["exit"]["enabled"] = False
-        else:
-            c["sizing"]["method"] = "score_weight"
-            c["rebalance"]["mode"] = key[-1]
-        out[key] = c
+    out = copy.deepcopy(base)
+    for k, v in (over or {}).items():
+        out[k] = _merge(out.get(k) or {}, v) if isinstance(v, dict) else copy.deepcopy(v)
     return out
+
+
+def variant_configs(cfg, variant_set="rules"):
+    return {key: _merge(cfg, over) for key, _lbl, over in VARIANT_SETS[variant_set][0]}
 
 
 def compare_row(key, label, res):
@@ -1186,7 +1205,7 @@ def compare_row(key, label, res):
 
 
 def compare(start=DEFAULT_START, end=None, cadence="weekly", cfg=None, out=OUT_XLSX,
-            refresh=False, use_cache=True):
+            refresh=False, use_cache=True, variant_set="rules"):
     """v1 균등 / v2-A / v2-B / v2-C 를 같은 스크리닝(캐시)·같은 가격으로 돌려 비교표를 만든다.
     첫 설정에서 스크리닝을 계산(느림)하고, 나머지는 캐시를 쓴다."""
     cfg = cfg or _load_cfg()
@@ -1207,32 +1226,35 @@ def compare(start=DEFAULT_START, end=None, cadence="weekly", cfg=None, out=OUT_X
     def screen_fn(asof):
         return screen_asof(asof, refresh=refresh, use_cache=use_cache, lag_days=lag_days)
 
-    cfgs = variant_configs(cfg)
+    variants, main_key = VARIANT_SETS[variant_set]
+    cfgs = variant_configs(cfg, variant_set)
     results, rows = {}, []
-    for k, (key, label) in enumerate(VARIANTS):
+    for k, (key, label, _over) in enumerate(variants):
         t0 = time.time()
         sp = os.path.join(BASE_DIR, "paper", f"replay_state_{key}.json")
-        res = simulate(dates, trading_days, screen_fn, panel, cfgs[key], sp, end=end, progress=(k == 0))
+        ew = strategy.every_weeks(cfgs[key]) if cadence == "weekly" else 1
+        res = simulate(dates[::ew], trading_days, screen_fn, panel, cfgs[key], sp, end=end, progress=(k == 0))
         results[key] = res
         rows.append(compare_row(key, label, res))
         log.info("  %s 완료 %.1fs: 수익률 %s%% 최대낙폭 %s%%", key, time.time() - t0,
                  rows[-1]["수익률%"], rows[-1]["최대낙폭%"])
-    b = results["v2_B"]["bench"]
+    b = results[main_key]["bench"]
     cmp_df = pd.DataFrame(rows)
     cmp_df["벤치마크 동일가중B&H%"] = round(b["ew_return_pct"], 2) if b.get("ew_return_pct") is not None else None
     cmp_df["벤치마크 중앙값%"] = round(b["median_return_pct"], 2) if b.get("median_return_pct") is not None else None
-    write_compare_report(cmp_df, results, cfgs, out, cadence, split_events)
+    write_compare_report(cmp_df, results, cfgs, out, cadence, split_events,
+                         variants=[(k, l) for k, l, _ in variants], main_key=main_key)
     log.info("compare 완료 → %s", out)
     return cmp_df
 
 
-def write_compare_report(cmp_df, results, cfgs, out, cadence, split_events=None):
-    main_key = "v2_B"
+def write_compare_report(cmp_df, results, cfgs, out, cadence, split_events=None, variants=None, main_key="v2_B"):
+    variants = variants or VARIANTS
     res = results[main_key]
     summary_df = build_summary(res, cfgs[main_key], cadence, split_events)
     # 자산추이: 설정별 총자산 + 벤치마크
     eq = None
-    for key, _ in VARIANTS:
+    for key, _ in variants:
         e = results[key]["equity"]
         if not len(e):
             continue
@@ -1253,13 +1275,13 @@ def write_compare_report(cmp_df, results, cfgs, out, cadence, split_events=None)
     os.makedirs(os.path.dirname(os.path.abspath(out)) or ".", exist_ok=True)
     with pd.ExcelWriter(out, engine="openpyxl") as xw:
         cmp_df.to_excel(xw, sheet_name="비교", index=False)
-        summary_df.to_excel(xw, sheet_name="요약(v2_B)", index=False)
+        summary_df.to_excel(xw, sheet_name=f"요약({main_key})", index=False)
         (eq if eq is not None else pd.DataFrame()).to_excel(xw, sheet_name="자산추이", index=False)
-        for key, _ in VARIANTS:
+        for key, _ in variants:
             pd.DataFrame(results[key]["trades"], columns=trade_cols).to_excel(
                 xw, sheet_name=f"거래_{key}", index=False)
-        pd.DataFrame(res["rebal_rows"], columns=rebal_cols).to_excel(xw, sheet_name="리밸런스별목록(v2_B)", index=False)
-        pd.DataFrame(res["rebal_summary"], columns=rs_cols).to_excel(xw, sheet_name="리밸런스요약(v2_B)", index=False)
+        pd.DataFrame(res["rebal_rows"], columns=rebal_cols).to_excel(xw, sheet_name=f"리밸런스별목록({main_key})"[:31], index=False)
+        pd.DataFrame(res["rebal_summary"], columns=rs_cols).to_excel(xw, sheet_name=f"리밸런스요약({main_key})"[:31], index=False)
         pd.DataFrame(_flatten(cfgs[main_key]), columns=["설정키", "값"]).to_excel(xw, sheet_name="설정", index=False)
         for ws in xw.book.worksheets:
             for col in ws.columns:
@@ -1300,6 +1322,8 @@ def replay(start=DEFAULT_START, end=None, cadence="weekly", cfg=None, out=OUT_XL
         return screen_asof(asof, refresh=refresh, use_cache=use_cache, lag_days=lag_days)
 
     t0 = time.time()
+    if cadence == "weekly":
+        dates = dates[::strategy.every_weeks(cfg)]
     res = simulate(dates, trading_days, screen_fn, panel, cfg, state_path, end=end)
     summary_df = write_report(res, cfg, out, cadence, split_events)
     log.info("replay 완료 %.1fs → %s (상태 %s)", time.time() - t0, out, state_path)
