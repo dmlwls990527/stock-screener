@@ -7,7 +7,8 @@ research_tilt.py — '지수를 이기기 위한' 비중·매매 규칙 사전�
   E0 대조군 : 그 시점 S&P 500 구성종목 시가총액 가중 (우리 데이터로 만든 지수 복제 — 생존편향 동일)
   E1        : E0 비중 × 12-1 모멘텀 3분위 (상위 1/3 ×1.5, 하위 1/3 ×0.5, 모멘텀 없음 ×1.0)
   E2        : E1 과 같되 점수 = 모멘텀 백분위 50% + TTM 영업이익률 백분위 50% (적자·재무없음은 이익률 0)
-  E3        : 시총 상위 50 중 모멘텀 하위 1/4 제외, 나머지 시가총액 가중
+  T0        : 시총 상위 N 그대로 시가총액 가중 (E3 의 대조군 — 거르기 효과 = E3 − T0)
+  E3        : 시총 상위 N 중 모멘텀 하위 1/4 제외, 나머지 시가총액 가중   (N = --top, 기본 50; 2026-09-30 --top 20 추가)
   공통: 분기 1회 (3·6·9·12월 마지막 거래일 신호 → 다음 날 시가), 목표와의 차이가 목표의 20% 이내면 매매 안 함
         (편입·편출은 항상 매매). 비용 = 거래금액 × 0.15%.
 판정(사전 고정): 설계 구간(2016~2022)에서 E0 와 SPY 를 둘 다 이긴 후보만 봉인 구간으로 넘긴다.
@@ -75,7 +76,7 @@ def quarter_signals(days):
     return {T: days[days.index(T) + 1] for T in last if days.index(T) + 1 < len(days)}
 
 
-def weights(mode, T, cl, MC, fin):
+def weights(mode, T, cl, MC, fin, top=50):
     mem = replay.index_members(T, "sp500_pit")
     mcrow = gf._at(MC, T)
     cols = [c for c in mem if c in mcrow.index and pd.notna(mcrow[c]) and mcrow[c] > 0
@@ -98,11 +99,14 @@ def weights(mode, T, cl, MC, fin):
         mult[score < 1 / 3] = 0.5
         w = base * mult
         return w / w.sum()
+    if mode == "T0":                                    # 시총 상위 N 그대로 (거르기 없음) — E3 의 대조군
+        big = mc.nlargest(top)
+        return big / big.sum()
     if mode == "E3":
-        top = mc.nlargest(50).index
-        m = mom.reindex(top)
+        big = mc.nlargest(top).index
+        m = mom.reindex(big)
         drop = m[m.rank(pct=True) <= 0.25].index
-        keep = top.difference(drop)
+        keep = big.difference(drop)
         return mc[keep] / mc[keep].sum()
     raise ValueError(mode)
 
@@ -110,6 +114,8 @@ def weights(mode, T, cl, MC, fin):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--period", choices=list(R.PERIODS), default="design")
+    ap.add_argument("--top", type=int, default=50, help="E3/T0 의 시총 상위 N (기본 50)")
+    ap.add_argument("--modes", default="E0,E1,E2,T0,E3", help="돌릴 후보 (E0 는 항상 포함)")
     a = ap.parse_args()
     start, end = R.PERIODS[a.period]
     latest = replay.db_latest_date()
@@ -124,10 +130,13 @@ def main():
     d1 = [d for d in days if d >= min(sig.values())]
     print(f"기간 {a.period}: {d1[0]} ~ {d1[-1]} | 분기 리밸런스 {len(sig)}회")
     res, extra = {}, {}
-    names = {"E0": "E0 대조군 시총가중(우리 데이터)", "E1": "E1 시총가중×모멘텀 기울기",
-             "E2": "E2 시총가중×모멘텀·이익률 기울기", "E3": "E3 시총상위50−모멘텀하위1/4"}
+    N = a.top
+    ALL = {"E0": "E0 대조군 시총가중(우리 데이터)", "E1": "E1 시총가중×모멘텀 기울기",
+           "E2": "E2 시총가중×모멘텀·이익률 기울기", "T0": f"T0 시총상위{N} 그대로(거르기 없음)",
+           "E3": f"E3 시총상위{N}−모멘텀하위1/4"}
+    names = {m: ALL[m] for m in ("E0",) + tuple(x for x in a.modes.split(",") if x != "E0")}
     for mode, label in names.items():
-        W = {D: weights(mode, T, cl, MC, fin) for T, D in sig.items()}
+        W = {D: weights(mode, T, cl, MC, fin, top=N) for T, D in sig.items()}
         eq, b = run_band(d1, op, cl, W)
         res[label] = eq
         extra[label] = {"누적수수료$": round(b.fees, 0),
@@ -152,19 +161,23 @@ def main():
     base = tab.set_index("전략")["연평균%"]
     tab["E0 대비 연%p"] = tab["전략"].map(lambda k: round(base[k] - base[names["E0"]], 2))
     tab["SPY 대비 연%p"] = tab["전략"].map(lambda k: round(base[k] - base["기준 SPY 보유"], 2))
+    if "T0" in names:
+        tab["T0 대비 연%p"] = tab["전략"].map(lambda k: round(base[k] - base[names["T0"]], 2))
     pd.set_option("display.width", 250)
     print(tab.to_string(index=False))
     print(Y.to_string())
-    out = f"/data/frame/research_tilt_{a.period}.xlsx"
+    out = f"/data/frame/research_tilt_{a.period}" + ("" if N == 50 else f"_top{N}") + ".xlsx"
     with pd.ExcelWriter(out, engine="openpyxl") as xw:
         tab.to_excel(xw, sheet_name="요약", index=False)
         Y.to_excel(xw, sheet_name="연도별")
         pd.DataFrame(res).to_excel(xw, sheet_name="자산추이")
-        pd.DataFrame({"항목": list(names.values()) + ["공통", "판정", "한계"],
-                      "값": ["그 시점 S&P 500 시가총액 가중 (대조군)",
-                            "시총 비중 × 12-1 모멘텀 상위 1/3 1.5배 / 하위 1/3 0.5배",
-                            "시총 비중 × (모멘텀 50% + 영업이익률 50%) 점수 3분위 1.5 / 1.0 / 0.5배",
-                            "시총 상위 50 중 모멘텀 하위 1/4 제외, 나머지 시총 가중",
+        desc = {"E0": "그 시점 S&P 500 시가총액 가중 (대조군)",
+                "E1": "시총 비중 × 12-1 모멘텀 상위 1/3 1.5배 / 하위 1/3 0.5배",
+                "E2": "시총 비중 × (모멘텀 50% + 영업이익률 50%) 점수 3분위 1.5 / 1.0 / 0.5배",
+                "T0": f"시총 상위 {N} 그대로 시총 가중 (E3 의 대조군 — 거르기 효과 = E3 − T0)",
+                "E3": f"시총 상위 {N} 중 모멘텀 하위 1/4 제외, 나머지 시총 가중"}
+        pd.DataFrame({"항목": [names[m] for m in names] + ["공통", "판정", "한계"],
+                      "값": [desc[m] for m in names] + [
                             "분기 1회, 목표와 20% 이내면 매매 안 함, 비용 0.15%",
                             "설계 구간에서 E0 와 SPY 를 둘 다 이긴 후보만 봉인 구간으로",
                             "시총 = 종가 × 지금 주식 수. 상장폐지 종목 없음 (E0 와 비교하면 상쇄)"]}
