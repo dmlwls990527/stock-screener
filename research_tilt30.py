@@ -34,7 +34,9 @@ N = 30
 SECTOR_CAP = 0.40
 NAMES = {"T0": "T0 시총상위30 그대로(대조군)", "F1": "F1 ×모멘텀 3분위", "F2": "F2 ×거래대금증가 3분위",
          "F3": "F3 ×영업이익증가 3분위", "F4": "F4 ×셋평균 3분위(제안)", "F5": "F5 셋평균 상위×2·하위 제외",
-         "F6": "F6 F4+섹터상한40%"}
+         "F6": "F6 F4+섹터상한40%",
+         "G1": "G1 영업이익3년연속↑×1.5·감소×0.5", "G2": "G2 영업이익·거래대금3년연속↑×1.5·감소×0.5",
+         "G3": "G3 성장점수 0.5~1.5배·감소×0.5"}
 
 
 def sector_map():
@@ -58,15 +60,22 @@ def top_cols(Tt, cl, MC):
 def signals(Tt, cols, cl, P, fin):
     mom = R.mom_scores(cl, Tt, cols).reindex(cols)
     amt = gf.features(Tt, P)["amt_g6"].reindex(cols)
-    _, op_now = R.ttm_margin(fin, Tt)
-    _, op_prev = R.ttm_margin(fin, pd.Timestamp(Tt) - pd.Timedelta(days=365))
-    opg = (op_now / op_prev - 1).where(op_prev > 0).reindex(cols)
+    ops = [R.ttm_margin(fin, pd.Timestamp(Tt) - pd.Timedelta(days=365 * k))[1].reindex(cols) for k in range(4)]
+    op_now, op_prev = ops[0], ops[1]
+    opg = (op_now / op_prev - 1).where(op_prev > 0)
 
     def pct(s):
         return s.rank(pct=True).reindex(cols).fillna(0.5)
 
     sc = {"mom": pct(mom), "amt": pct(amt), "opi": pct(opg)}
     sc["all"] = (sc["mom"] + sc["amt"] + sc["opi"]) / 3
+    # 2026-09-30 사용자 제안: '지속적으로' 증가 (3년 연속) 와 '영업이익 감소는 비중 축소'
+    f = gf.features(Tt, P)
+    sc["op_up3"] = ((ops[0] > ops[1]) & (ops[1] > ops[2]) & (ops[2] > ops[3])).fillna(False)
+    sc["op_down"] = (ops[0] < ops[1]).fillna(False)
+    sc["amt_steady"] = f["amt_steady"].reindex(cols).fillna(False).astype(bool)
+    op_cagr3 = ((ops[0] / ops[3]) ** (1 / 3) - 1).where((ops[0] > 0) & (ops[3] > 0))
+    sc["grow"] = (pct(op_cagr3) + pct(f["amt_cagr3"].reindex(cols))) / 2
     return sc
 
 
@@ -104,6 +113,12 @@ def all_weights(Tt, cl, MC, P, fin, sec):
          "F4": tilt(base, sc["all"]), "F5": tilt(base, sc["all"], 2.0, 0.0)}
     w["F5"] = w["F5"][w["F5"] > 0]
     w["F6"] = sector_capped(w["F4"], sec)
+    m1 = pd.Series(1.0, index=base.index); m1[sc["op_up3"]] = 1.5; m1[sc["op_down"]] = 0.5
+    w["G1"] = (base * m1) / (base * m1).sum()
+    m2 = pd.Series(1.0, index=base.index); m2[sc["op_up3"] & sc["amt_steady"]] = 1.5; m2[sc["op_down"]] = 0.5
+    w["G2"] = (base * m2) / (base * m2).sum()
+    m3 = 0.5 + sc["grow"]; m3[sc["op_down"]] *= 0.5
+    w["G3"] = (base * m3) / (base * m3).sum()
     return w
 
 
@@ -176,6 +191,9 @@ def main():
                             "T0 × 세 점수 평균 3분위 (사용자 제안)",
                             "세 점수 평균 상위 1/3 ×2, 하위 1/3 은 뺌",
                             f"F4 에 섹터 상한 {int(SECTOR_CAP * 100)}% (지금 GICS 섹터, 시점별 아님)",
+                            "TTM 영업이익이 3년 연속 증가 ×1.5, 전년보다 감소 ×0.5 (사용자 제안 '지속 증가·감소는 축소')",
+                            "영업이익 3년 연속↑ 이면서 연평균 거래대금도 3년 연속↑ ×1.5, 영업이익 감소 ×0.5",
+                            "성장점수 = (영업이익 3년 CAGR 백분위 + 거래대금 3년 CAGR 백분위)/2 → 배수 0.5~1.5, 영업이익 감소는 다시 ×0.5",
                             "분기 1회, ±20% 밴드, 비용 0.15%, 결측 점수는 중간",
                             "설계 구간에서 T0 와 SPY 를 둘 다 이겨야 후보. 봉인 구간은 이미 열려 참고값",
                             "세금 미반영. 상장폐지 종목 없음. 시총 = 종가 × 지금 주식 수(근사)"]}
