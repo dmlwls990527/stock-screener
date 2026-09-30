@@ -1,0 +1,5 @@
+0 8 * * 1 /bin/bash /data/frame/weekly_cron.sh
+# auto_buy 페이퍼 (2026-09-29): 23:15/00:15 두 번 = 서머타임·겨울 모두 대응, 진입 창 밖이면 rc 3 으로 그냥 끝남
+15 23 * * 1-5 /bin/bash /data/frame/auto_buy_cron.sh run exits
+15 0 * * 2-6 /bin/bash /data/frame/auto_buy_cron.sh run exits
+10 6 * * 2-6 /bin/bash /data/frame/auto_buy_cron.sh tick
