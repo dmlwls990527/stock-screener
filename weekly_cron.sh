@@ -44,6 +44,9 @@ run_stage "성장·순위 지표 시트" 900 growth_sheet.py
 # 편입·편출 이력 파일을 먼저 갱신한다 (실패하면 기존 파일 그대로 사용)
 curl -s -L --max-time 60 -o data/sp500_ticker_start_end.csv.new   "https://raw.githubusercontent.com/fja05680/sp500/master/sp500_ticker_start_end.csv"   && [ -s data/sp500_ticker_start_end.csv.new ] && mv data/sp500_ticker_start_end.csv.new data/sp500_ticker_start_end.csv
 run_stage "자동매수 후보 (S&P500 상위10)" 900 auto_candidates.py
+# --- 판단 위성 (2026-09-30): S&P500∪NDX100 에서 6개월 꺼졌다 켜진 신호 에피소드 + 모의 장부 성적표 → satellite_latest.xlsx
+#     월요일 Claude 세션이 이 파일의 신규 후보를 조사해 satellite.py decide 로 판단을 기록한다. 실제 주문 없음.
+run_stage "판단 위성 후보·성적표" 1200 satellite.py weekly
 
 # 구형 스크리너(monthly_top50 / theme_daily / sector_screen / theme_screen)는 2026-09-03 제외.
 # 6월에 만든 모멘텀·테마 팩터 기반인데, 이후 IC 검증에서 예측력이 유의하지 않게 나와
