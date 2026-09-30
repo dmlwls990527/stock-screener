@@ -66,9 +66,17 @@ def fin_table():
     return f
 
 
+def dedupe_quarters(fin):
+    """52/53주 회계연도 회사(WAT·MSI·LMT 등 45종, 139행)는 같은 분기가 두 날짜로 들어 있다 (2026-09-30 발견).
+    10일 이내 근접 행은 뒤의 것만 남긴다. 전체 62,202행 중 0.2% 라 기존 결론에는 영향 없음, WAT 같은 개별 종목 TTM 은 달라진다."""
+    f = fin.sort_values(["code", "end"]).copy()
+    nxt = f.groupby("code")["end"].shift(-1)
+    return f[(~((nxt - f["end"]).dt.days <= 10)).fillna(True)]
+
+
 def ttm_margin(fin, asof, lag=45):
     cut = pd.Timestamp(asof) - pd.Timedelta(days=lag)
-    g = fin[fin["end"] <= cut].groupby("code").tail(4)
+    g = dedupe_quarters(fin[fin["end"] <= cut]).groupby("code").tail(4)
     s = g.groupby("code").agg(n=("rev", "size"), rev=("rev", "sum"), op=("op", "sum"))
     s = s[(s["n"] == 4) & (s["rev"] > 0)]
     return (s["op"] / s["rev"]).rename("margin"), s["op"]

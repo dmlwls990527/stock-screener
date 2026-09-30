@@ -100,11 +100,21 @@ def names_sectors():
 _TTM = {}
 
 
+def dedupe_quarters(fin):
+    """52/53주 회계연도 회사(WAT·MSI·LMT 등 45종)는 같은 분기가 캘린더 말일·실제 말일 두 행으로 들어 있다
+    (2026-09-30 발견, 139행). 10일 이내 근접 행은 뒤의 것만 남긴다 — 안 지우면 TTM 합에 같은 분기가 두 번 들어간다."""
+    f = fin.sort_values(["code", "end"]).copy()
+    nxt = f.groupby("code")["end"].shift(-1)
+    keep = ~((nxt - f["end"]).dt.days <= 10)
+    return f[keep.fillna(True)]
+
+
 def ttm(fin, asof, lag=45):
     cut = pd.Timestamp(asof) - pd.Timedelta(days=lag)
     if cut in _TTM:
         return _TTM[cut]
-    g = fin[(fin["end"] <= cut) & (fin["end"] > cut - pd.Timedelta(days=430))].groupby("code").tail(4)
+    f = dedupe_quarters(fin)
+    g = f[(f["end"] <= cut) & (f["end"] > cut - pd.Timedelta(days=430))].groupby("code").tail(4)
     s = g.groupby("code").agg(n=("rev", "size"), rev=("rev", "sum"), op=("op", "sum"))
     _TTM[cut] = s[s["n"] == 4]
     return _TTM[cut]
@@ -112,7 +122,7 @@ def ttm(fin, asof, lag=45):
 
 def ttm_growth_series(fin, code):
     """분기 말마다 TTM 매출 전년 대비 증가율 (최근 것이 마지막). 매도 규칙용."""
-    q = fin[fin["code"] == code].sort_values("end")
+    q = dedupe_quarters(fin[fin["code"] == code]).sort_values("end")
     if len(q) < 8:
         return pd.Series(dtype=float), pd.Series(dtype=float)
     rev = q.set_index("end")["rev"].rolling(4).sum()
@@ -198,6 +208,9 @@ def build_candidates(T=None):
             "TTM영업이익(백만$)": round(op / 1e6, 0) if pd.notna(op) else np.nan,
             "영업이익률%": round(op / rev * 100, 1) if pd.notna(op) and pd.notna(rev) and rev else np.nan,
             "재무필터(매출+20%·흑자)": ("O" if (pd.notna(rg) and rg >= 0.20 and pd.notna(op) and op > 0) else ("X" if pd.notna(rg) else "재무없음")),
+            "주의": " / ".join(w for w in (
+                "매출 +40% 이상: 인수·합병 가능성 → 유기 성장 따로 확인" if pd.notna(rg) and rg >= 0.40 else "",
+                "GAAP 영업이익률 10% 미만: 인수회계·일회성 비용 가능성 → 조정 마진 확인" if pd.notna(op) and pd.notna(rev) and rev and op / rev < 0.10 else "") if w),
             "거래대금3년연속↑": "O" if bool(f["amt_steady"].get(c, False)) else "X",
             "시총3년연속↑": "O" if bool(f["mc_steady"].get(c, False)) else "X",
             "3년거래대금증가율%": round(float(f["amt_cagr3"].get(c, np.nan)) * 100, 0) if pd.notna(f["amt_cagr3"].get(c, np.nan)) else np.nan,
