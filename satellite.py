@@ -242,6 +242,7 @@ def cmd_decide(path):
         tk, act = x["ticker"].strip().upper(), x["action"].strip()
         rec = {"asof": asof, "recorded_at": dt.datetime.now().isoformat(timespec="seconds"), "ticker": tk, "action": act,
                "confidence": x.get("confidence"), "thesis": x.get("thesis", ""), "risks": x.get("risks", ""),
+               "consensus": x.get("consensus", ""),          # 2026-10-01: EPS 추정치 방향·목표가 대비 위치 (등급은 근거로 안 씀)
                "in_episodes": bool(tk in set(ep["티커"]))}
         note = ""
         if act == "매수":
@@ -404,8 +405,11 @@ def cmd_report():
     ep = pd.read_csv(EPIS) if os.path.exists(EPIS) else pd.DataFrame()
     Dv = D.copy()
     if len(Dv):
-        Dv = Dv[["asof", "ticker", "action", "confidence", "thesis", "risks", "note"]].rename(
-            columns={"asof": "판단일", "ticker": "티커", "action": "판단", "confidence": "확신도", "thesis": "근거", "risks": "위험", "note": "비고"})
+        if "consensus" not in Dv.columns:
+            Dv["consensus"] = ""
+        Dv = Dv[["asof", "ticker", "action", "confidence", "thesis", "risks", "consensus", "note"]].rename(
+            columns={"asof": "판단일", "ticker": "티커", "action": "판단", "confidence": "확신도", "thesis": "근거", "risks": "위험",
+                     "consensus": "컨센서스(EPS 추정 방향·목표가 대비)", "note": "비고"})
     desc = pd.DataFrame({"항목": ["신호에피소드", "판단기록", "보유·대기", "성적표", "기준선", "매매 규칙", "주의"],
                          "값": ["S&P 500 ∪ 나스닥100 중 12-1 모멘텀 ≥ SPY +20%p · 종가 ≥ 52주고점 85% · 6개월 거래대금 증가, 직전 6개 월말 모두 꺼져 있던 것. '신규' = 이번 주 처음 등장",
                                "매주 월요일 Claude 세션이 신규 후보(최대 10개)를 조사해 매수/관망/제외 + 근거·위험을 기록. 덧붙이기만 하고 수정 불가",
