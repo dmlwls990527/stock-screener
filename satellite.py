@@ -202,6 +202,10 @@ def build_candidates(T=None):
             "종가$": round(float(CL[c].iloc[n]), 2),
             "시총(십억$)": round(float(mcrow.get(c, np.nan)) / 1e9, 1) if pd.notna(mcrow.get(c, np.nan)) else np.nan,
             "시총순위": int(rkrow.get(c)) if pd.notna(rkrow.get(c, np.nan)) else np.nan,
+            "1년전순위": int(f["rank1"].get(c)) if pd.notna(f["rank1"].get(c, np.nan)) else np.nan,
+            "2년전순위": int(f["rank2"].get(c)) if pd.notna(f["rank2"].get(c, np.nan)) else np.nan,
+            "시총1년증가%": round((f["mc_0"].get(c, np.nan) / f["mc_1"].get(c, np.nan) - 1) * 100, 0) if pd.notna(f["mc_1"].get(c, np.nan)) and f["mc_1"].get(c, 0) > 0 else np.nan,
+            "시총3년연평균증가%": round(float(f["mc_cagr3"].get(c, np.nan)) * 100, 0) if pd.notna(f["mc_cagr3"].get(c, np.nan)) else np.nan,
             "12-1수익률%": round(float(mom[c]) * 100, 0), "SPY대비%p": round(float(mom[c] - bm) * 100, 0),
             "52주고점대비%": round(float(nh[c]) * 100, 0), "거래대금6개월증가%": round(float(ag[c]) * 100, 0),
             "TTM매출증가%": round(rg * 100, 0) if pd.notna(rg) else np.nan,
@@ -410,8 +414,31 @@ def cmd_report():
                                "필터만 믿고 사면(2013~ 대조군 5,630회) 1년 뒤 48% 가 지수를 이기고 중앙값 −1.4%p, 16% 가 +30%p 이상",
                                f"손절 없음 · 최대 {MAX_POS}종목 · 1종목당 (현금+평가)÷{MAX_POS} · 최소 1년 보유 · 자동 매도는 TTM 매출증가 {SELL_QUARTERS}분기 연속 {int(SELL_GROWTH*100)}% 미만 또는 영업이익 적자만",
                                "Claude 의 판단에 실력이 있는지는 아무도 모른다 — 이 파일은 그것을 측정하기 위한 것이다. SPY 배당 포함(총수익)"]})
+    cols_desc = pd.DataFrame({"열": [
+        "지수", "첫 신호일 / 신규", "시총(십억$) / 시총순위", "1년전순위 / 2년전순위", "시총1년증가% / 시총3년연평균증가%",
+        "12-1수익률%", "SPY대비%p", "52주고점대비%", "거래대금6개월증가%", "TTM매출증가%", "TTM영업이익(백만$)", "영업이익률%",
+        "재무필터(매출+20%·흑자)", "주의", "거래대금3년연속↑ / 시총3년연속↑", "3년거래대금증가율%"],
+        "뜻": [
+        "지금 S&P 500 / 나스닥100 구성 여부 (둘 다면 S&P500+NDX100)",
+        "이 종목의 신호가 처음 관측된 주 / 이번 주 처음 등장하면 O. 신호가 꺼졌다가 6개월 뒤 다시 켜지면 다시 신규",
+        "기준일 시가총액과 미국 상장사 중 순위 (DB 기준)",
+        "1년 전·2년 전 같은 날의 시총 순위. 순위가 올라오는 중인지 본다 (숫자가 작아질수록 커진 것)",
+        "시총 1년 변화율 / 3년 연평균 변화율. 과거 시총은 종가 × 지금 주식 수 근사라 자사주 매입·증자는 안 잡힌다",
+        "12개월 전 종가 → 1개월 전 종가 수익률. 최근 1개월을 빼는 이유는 단기 되돌림 소음을 거르기 위해서(학계 표준 모멘텀)",
+        "같은 기간 SPY 수익률을 뺀 초과분. 필터 조건 1: +20%p 이상",
+        "기준일 종가 ÷ 최근 252거래일 최고 종가 × 100. 100 = 신고가. 필터 조건 2: 85 이상",
+        "최근 126거래일 일평균 거래대금 ÷ 그 전 126거래일 − 1. 필터 조건 3: 0 초과 (돈이 들어오는 중)",
+        "최근 4개 분기 매출 합 ÷ 1년 전 4개 분기 합 − 1. 실적 공시 지연 45일 반영. 인수가 있으면 비유기 성장이 섞인다",
+        "최근 4개 분기 GAAP 영업이익 합. 회사가 발표하는 '조정' 영업이익과 다를 수 있다 (상각·통합비용·주식보상 포함)",
+        "TTM 영업이익 ÷ TTM 매출. GAAP 기준이라 인수 직후에는 낮게 나온다 (WAT 7% 사례)",
+        "O = 매출 +20% 이상이면서 영업이익 흑자. X = 둘 중 하나 미달. 재무없음 = DB(SEC 추출)에 최근 4분기가 없음 — 회사 문제가 아니라 데이터 공백일 수 있다",
+        "매출 +40% 이상(인수 가능성) / GAAP 마진 10% 미만(인수회계·일회성) → 유기 성장과 조정 마진을 따로 확인하라는 표시",
+        "연 평균 일 거래대금 / 시총이 3년 연속 증가했는지",
+        "연 평균 일 거래대금의 3년 연평균 증가율"]})
     with pd.ExcelWriter(OUT, engine="openpyxl") as xw:
         (ep if len(ep) else pd.DataFrame({"안내": ["이번 주 6개월 꺼졌다 켜진 종목 없음"]})).to_excel(xw, sheet_name="신호에피소드", index=False)
+        if len(ep):
+            cols_desc.to_excel(xw, sheet_name="신호에피소드", index=False, startrow=len(ep) + 3)
         (Dv if len(Dv) else pd.DataFrame({"안내": ["아직 판단 기록 없음"]})).to_excel(xw, sheet_name="판단기록", index=False)
         H.to_excel(xw, sheet_name="보유·대기", index=False)
         (A if len(A) else pd.DataFrame({"안내": ["아직 성적 없음"]})).to_excel(xw, sheet_name="성적표", index=False, startrow=0)
